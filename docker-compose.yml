@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  prusaquoting:
+    build: .
+    image: prusaquoting:latest
+    ports:
+      - "5111:5111"
+    volumes:
+      # Mount your local PrusaSlicer config so your printer/filament/print profiles
+      # are available inside the container.
+      - "${PRUSASLICER_CONFIG:-${HOME}/Library/Application Support/PrusaSlicer}:/data/prusaslicer_config:ro"
+      # Persistent volume for saved presets and GCode exports
+      - prusaquoting_data:/data
+    environment:
+      - PORT=5111
+
+volumes:
+  prusaquoting_data:

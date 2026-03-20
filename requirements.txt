@@ -1,0 +1,5 @@
+flask
+trimesh
+networkx
+rtree
+numpy

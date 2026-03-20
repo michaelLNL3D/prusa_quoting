@@ -19,11 +19,11 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-PRUSASLICER  = "/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer"
-ORCASLICER   = "/Applications/OrcaSlicer.app/Contents/MacOS/OrcaSlicer"
-PRUSA_VENDOR_DIR = "/Applications/PrusaSlicer.app/Contents/Resources/profiles"
-PRUSA_USER_DIR   = os.path.expanduser("~/Library/Application Support/PrusaSlicer")
-PORT = 5111
+PRUSASLICER  = os.environ.get("PRUSASLICER_PATH",  "/Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer")
+ORCASLICER   = os.environ.get("ORCASLICER_PATH",   "/Applications/OrcaSlicer.app/Contents/MacOS/OrcaSlicer")
+PRUSA_VENDOR_DIR = os.environ.get("PRUSA_VENDOR_DIR", "/Applications/PrusaSlicer.app/Contents/Resources/profiles")
+PRUSA_USER_DIR   = os.environ.get("PRUSA_USER_DIR",   os.path.expanduser("~/Library/Application Support/PrusaSlicer"))
+PORT = int(os.environ.get("PORT", 5111))
 
 # Persistent scratch dir for 3MF exports (survives request lifecycle)
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "prusaquoting_exports")
@@ -613,7 +613,7 @@ def api_profiles():
     return jsonify({"print_profiles": pp, "filament_profiles": fp})
 
 
-PRESETS_FILE = os.path.expanduser("~/.prusaquoting_presets.json")
+PRESETS_FILE = os.environ.get("PRESETS_FILE", os.path.expanduser("~/.prusaquoting_presets.json"))
 PRESET_KEYS  = ["printer", "print_profile", "filament", "infill",
                 "layer_height", "walls", "supports",
                 "cost_per_kg", "hourly_rate", "markup", "farm_size"]
