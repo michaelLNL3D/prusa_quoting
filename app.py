@@ -269,11 +269,12 @@ def _translate_to_origin(mesh):
     mesh.apply_translation(-mesh.bounds[0])
 
 
-def split_if_needed(stl_path, build_vol, tmpdir):
+def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
     """
-    Check if the model fits in build_vol. If not, split it into pieces using trimesh.
+    Split model into pieces that fit the build volume.
+    Cuts at the CENTER of the model along the largest overflowing axis, recursively.
+    If do_orient is True, auto-orients each final piece with OrcaSlicer.
     Returns list of (stl_path, label) tuples.
-    Each piece is guaranteed to fit (or a best-effort split is done).
     """
     try:
         import trimesh as tm
@@ -281,60 +282,70 @@ def split_if_needed(stl_path, build_vol, tmpdir):
         return [(stl_path, "whole")]
 
     mesh = tm.load(stl_path, force="mesh")
-    extents = mesh.extents  # [size_x, size_y, size_z]
-    bv = build_vol
-    fits = extents[0] <= bv["x"] and extents[1] <= bv["y"] and extents[2] <= bv["z"]
+    bv   = build_vol
 
-    if fits:
+    def mesh_fits(m):
+        e = m.extents
+        return e[0] <= bv["x"] and e[1] <= bv["y"] and e[2] <= bv["z"]
+
+    if mesh_fits(mesh):
         return [(stl_path, "whole")]
 
-    # Figure out which axes overflow
     piece_dir = os.path.join(tmpdir, "pieces")
     os.makedirs(piece_dir, exist_ok=True)
     base_name = Path(stl_path).stem
 
-    # Recursively split meshes until each piece fits or we can't split further
-    def try_split(mesh_in, label_in, depth=0):
-        ext = mesh_in.extents
-        # Check each axis in overflow order (biggest first)
-        axes_overflow = []
-        for ax, limit in [(2, bv["z"]), (0, bv["x"]), (1, bv["y"])]:
-            if ext[ax] > limit + 0.5:  # 0.5mm tolerance
-                axes_overflow.append((ext[ax] - limit, ax, limit))
-        if not axes_overflow or depth > 6:
-            # Can't split further or already tried enough
-            out_path = os.path.join(piece_dir, f"{base_name}_{label_in}.stl")
+    def try_split(mesh_in, depth=0):
+        if mesh_fits(mesh_in) or depth > 6:
+            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
             _translate_to_origin(mesh_in)
             mesh_in.export(out_path)
-            return [(out_path, label_in)]
+            return [out_path]
 
-        axes_overflow.sort(reverse=True)  # biggest overflow first
-        _, ax, limit = axes_overflow[0]
-        bounds = mesh_in.bounds
-        cut_pos = bounds[0][ax] + limit - 1.0  # 1mm margin below the build limit
+        # Find the largest overflowing axis and cut at its center
+        ext = mesh_in.extents
+        overflow = sorted(
+            [(ext[ax] - lim, ax) for ax, lim in [(0, bv["x"]), (1, bv["y"]), (2, bv["z"])]
+             if ext[ax] > lim + 0.5],
+            reverse=True
+        )
+        if not overflow:
+            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
+            _translate_to_origin(mesh_in)
+            mesh_in.export(out_path)
+            return [out_path]
+
+        _, ax = overflow[0]
+        # Cut at the geometric center of this mesh along the overflowing axis
+        cut_pos = (mesh_in.bounds[0][ax] + mesh_in.bounds[1][ax]) / 2.0
 
         halves = _split_mesh_along_axis(mesh_in, ax, cut_pos, piece_dir, base_name, depth)
         if len(halves) < 2:
-            # Split produced < 2 pieces, export as-is
-            out_path = os.path.join(piece_dir, f"{base_name}_{label_in}.stl")
+            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
             _translate_to_origin(mesh_in)
             mesh_in.export(out_path)
-            return [(out_path, label_in)]
+            return [out_path]
 
         results = []
-        for i, (half_mesh, half_label) in enumerate(halves):
-            sub_label = f"{label_in}_p{i+1}"
-            _translate_to_origin(half_mesh)  # seat each half at Z=0
-            results.extend(try_split(half_mesh, sub_label, depth + 1))
+        for half_mesh, _ in halves:
+            _translate_to_origin(half_mesh)
+            results.extend(try_split(half_mesh, depth + 1))
         return results
 
-    pieces = try_split(mesh, "part")
+    raw_paths = try_split(mesh)
+    n = len(raw_paths)
 
-    # Number the pieces cleanly
-    numbered = []
-    for i, (path, label) in enumerate(pieces):
-        numbered.append((path, f"piece {i+1} of {len(pieces)}"))
-    return numbered
+    # Auto-orient each piece if requested
+    final_pieces = []
+    for i, path in enumerate(raw_paths):
+        label = f"piece {i+1} of {n}"
+        if do_orient:
+            oriented_path, _ = auto_orient(path, tmpdir)
+            final_pieces.append((oriented_path, label))
+        else:
+            final_pieces.append((path, label))
+
+    return final_pieces
 
 
 # ── Sizing args ───────────────────────────────────────────────────────────────
@@ -602,6 +613,46 @@ def api_profiles():
     return jsonify({"print_profiles": pp, "filament_profiles": fp})
 
 
+PRESETS_FILE = os.path.expanduser("~/.prusaquoting_presets.json")
+PRESET_KEYS  = ["printer", "print_profile", "filament", "infill",
+                "layer_height", "walls", "supports",
+                "cost_per_kg", "hourly_rate", "markup", "farm_size"]
+
+def _load_presets():
+    try:
+        with open(PRESETS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def _save_presets(data):
+    with open(PRESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+@app.route("/api/presets", methods=["GET"])
+def api_presets_get():
+    return jsonify(_load_presets())
+
+@app.route("/api/presets", methods=["POST"])
+def api_presets_save():
+    body = request.get_json(force=True)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    presets = _load_presets()
+    presets[name] = {k: body.get(k, "") for k in PRESET_KEYS}
+    _save_presets(presets)
+    return jsonify({"ok": True, "name": name})
+
+@app.route("/api/presets/<name>", methods=["DELETE"])
+def api_presets_delete(name):
+    presets = _load_presets()
+    presets.pop(name, None)
+    _save_presets(presets)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/quote", methods=["POST"])
 def api_quote():
     file = request.files.get("file")
@@ -623,6 +674,7 @@ def api_quote():
     markup       = form.get("markup", "").strip()
     quantity     = int(form.get("quantity", 1) or 1)
     time_factor  = float(form.get("time_factor", 1.0) or 1.0)
+    farm_size    = max(1, int(form.get("farm_size", 1) or 1))
     do_orient    = form.get("auto_orient") == "true"
     do_split     = form.get("auto_split")  == "true"
 
@@ -654,10 +706,6 @@ def api_quote():
         orient_note = None
         work_path   = input_path
 
-        # ── Auto-orient ──────────────────────────────────────────────────────
-        if do_orient:
-            work_path, orient_note = auto_orient(input_path, tmpdir)
-
         # ── Determine pieces to slice ─────────────────────────────────────────
         pieces = []   # list of (stl_path, label)
 
@@ -684,17 +732,31 @@ def api_quote():
                 if sz > build_vol["z"]: over.append(f"Z {sz:.0f} > {build_vol['z']:.0f} mm")
                 if over:
                     if do_split:
-                        pieces = split_if_needed(work_path, build_vol, tmpdir)
+                        # Split at center of overflowing axis; orient each piece if requested
+                        pieces = split_if_needed(work_path, build_vol, tmpdir, do_orient=do_orient)
+                        if do_orient:
+                            orient_note = "each piece auto-oriented"
                     else:
                         overflow_warning = f"Model exceeds build volume ({', '.join(over)}). Enable Auto-Split to cut it into printable pieces."
+                        # Still auto-orient the single piece if requested
+                        if do_orient:
+                            work_path, orient_note = auto_orient(work_path, tmpdir)
                         pieces = [(work_path, "whole")]
                 else:
+                    # Fits — auto-orient if requested
+                    if do_orient:
+                        work_path, orient_note = auto_orient(work_path, tmpdir)
                     pieces = [(work_path, "whole")]
             elif do_split:
-                pieces = split_if_needed(work_path, build_vol, tmpdir)
+                pieces = split_if_needed(work_path, build_vol, tmpdir, do_orient=do_orient)
+                if do_orient:
+                    orient_note = "each piece auto-oriented"
             else:
                 pieces = [(work_path, "whole")]
         else:
+            # No printer selected — just orient if requested
+            if do_orient:
+                work_path, orient_note = auto_orient(work_path, tmpdir)
             pieces = [(work_path, "whole")]
 
         # ── Build machine-limits-only ini for user printer profiles (e.g. Klipper) ─
@@ -716,19 +778,23 @@ def api_quote():
         piece_results = []
         errors_out    = []
 
-        persistent_gcode = os.path.join(EXPORT_DIR, "last_slice.gcode")
+        gcode_paths = []   # (label, path) for all successfully sliced pieces
         for idx, (piece_path, piece_label) in enumerate(pieces):
+            persistent_gcode = os.path.join(EXPORT_DIR, f"piece_{idx}.gcode")
             try:
                 stats = slice_piece(
                     piece_path, tmpdir, idx,
                     printer, print_prof, filament,
                     size_val, size_mode, infill, layer_h, walls, supports,
                     machine_limits_ini=machine_limits_ini,
-                    persistent_gcode_path=persistent_gcode if idx == 0 else None,
+                    persistent_gcode_path=persistent_gcode,
                 )
                 piece_results.append({"label": piece_label, "stats": stats})
+                gcode_paths.append((piece_label, persistent_gcode))
             except RuntimeError as e:
                 errors_out.append(f"{piece_label}: {e}")
+
+        _last_job["gcode_paths"] = gcode_paths
 
         if not piece_results:
             return jsonify({"error": "\n".join(errors_out) or "Slicing failed for all pieces"}), 500
@@ -781,6 +847,12 @@ def api_quote():
     qty_time   = mins_to_str(total_mins * quantity) if quantity > 1 else None
     qty_weight = round(total_g * quantity, 1)       if quantity > 1 else None
 
+    import math as _math
+    farm_time = None
+    if farm_size > 1 and total_mins > 0:
+        batches   = _math.ceil(quantity / farm_size)
+        farm_time = mins_to_str(total_mins * batches)
+
     return jsonify({
         "filename":       file.filename,
         "printer":        printer,
@@ -812,6 +884,8 @@ def api_quote():
         "hourly_rate":    float(hourly_rate)  if hourly_rate  else None,
         "errors":           errors_out,
         "overflow_warning": overflow_warning,
+        "farm_size":        farm_size,
+        "farm_time":        farm_time,
     })
 
 
@@ -864,13 +938,28 @@ def api_export_ini():
 
 @app.route("/api/export_gcode")
 def api_export_gcode():
-    """Download the actual sliced gcode for the last quote (drag into PrusaSlicer Preview to verify)."""
-    gcode = os.path.join(EXPORT_DIR, "last_slice.gcode")
-    if not os.path.exists(gcode):
+    """Download sliced gcode(s) for the last quote. Single piece → .gcode, multiple → .zip."""
+    import zipfile, io
+    gcode_paths = _last_job.get("gcode_paths", [])
+    gcode_paths = [(lbl, p) for lbl, p in gcode_paths if os.path.exists(p)]
+    if not gcode_paths:
         return jsonify({"error": "No gcode — run a quote first"}), 400
+
     stem = Path(_last_job.get("filename", "quote")).stem
-    return send_file(gcode, as_attachment=True, download_name=f"{stem}_quote.gcode",
-                     mimetype="text/plain")
+
+    if len(gcode_paths) == 1:
+        lbl, path = gcode_paths[0]
+        return send_file(path, as_attachment=True, download_name=f"{stem}_quote.gcode",
+                         mimetype="text/plain")
+
+    # Multiple pieces — zip them
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (lbl, path) in enumerate(gcode_paths, 1):
+            zf.write(path, f"{stem}_piece{i}_{lbl}.gcode")
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f"{stem}_quote.zip",
+                     mimetype="application/zip")
 
 
 # ── HTML / CSS / JS ───────────────────────────────────────────────────────────
@@ -1030,6 +1119,32 @@ HTML = """<!DOCTYPE html>
   /* Error box */
   #error-box { display: none; background: rgba(255,107,107,.08); border: 1px solid rgba(255,107,107,.3); border-radius: 10px; padding: 1rem 1.2rem; color: var(--danger); font-size: 0.82rem; font-family: monospace; white-space: pre-wrap; word-break: break-all; margin-top: 1rem; }
   .warn-row { background: rgba(255,169,77,.07); border: 1px solid rgba(255,169,77,.25); border-radius: 8px; padding: 0.55rem 0.85rem; color: var(--warn); font-size: 0.78rem; margin-bottom: 0.75rem; }
+  .preset-bar { display:flex; gap:0.5rem; align-items:center; margin-bottom:0.75rem; flex-wrap:wrap; }
+  .preset-bar select { flex:1; min-width:0; }
+  .preset-btn { background:var(--input-bg); border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:0.4rem 0.65rem; font-size:0.75rem; font-weight:700; cursor:pointer; white-space:nowrap; transition:all .15s; }
+  .preset-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .preset-btn.del-btn:hover { border-color:#ff6b6b; color:#ff6b6b; }
+  .preset-btn.save-btn { border-color:rgba(78,205,196,.4); color:var(--accent2); width:100%; padding:0.5rem; margin-bottom:0.75rem; }
+  .preset-btn.save-btn:hover { background:rgba(78,205,196,.08); }
+  #file-queue { margin-top:0.75rem; display:none; }
+  .queue-item { display:flex; align-items:center; gap:0.5rem; background:var(--input-bg); border:1px solid var(--border); border-radius:7px; padding:0.4rem 0.75rem; margin-bottom:0.3rem; font-size:0.8rem; }
+  .queue-item.st-slicing { border-color:var(--accent); }
+  .queue-item.st-done    { border-color:#51cf66; }
+  .queue-item.st-error   { border-color:#ff6b6b; }
+  .queue-fname  { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); }
+  .queue-status { font-size:0.7rem; font-weight:700; letter-spacing:.04em; color:var(--muted); flex-shrink:0; }
+  .queue-status.st-pending  { color:var(--muted); }
+  .queue-status.st-slicing  { color:var(--accent); }
+  .queue-status.st-done     { color:#51cf66; }
+  .queue-status.st-error    { color:#ff6b6b; }
+  .queue-clear { background:none; border:none; color:var(--muted); cursor:pointer; font-size:0.75rem; padding:0.1rem 0.3rem; border-radius:4px; }
+  .queue-clear:hover { color:#ff6b6b; }
+  .batch-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-top:0.5rem; }
+  .batch-table th { text-align:left; padding:0.35rem 0.5rem; font-size:0.68rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--border); }
+  .batch-table td { padding:0.4rem 0.5rem; border-bottom:1px solid rgba(42,45,62,.5); }
+  .batch-table tr:last-child td { border-bottom:none; }
+  .batch-totals td { border-top:1px solid var(--border); font-weight:700; color:var(--accent2); padding-top:0.55rem; }
+  .batch-err { color:#ff6b6b; font-size:0.75rem; }
   /* Placeholder */
   .placeholder { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4rem 2rem; color: var(--muted); text-align: center; gap: 0.75rem; }
   .placeholder-icon { font-size: 3rem; opacity: .3; }
@@ -1045,12 +1160,26 @@ HTML = """<!DOCTYPE html>
     <!-- Left: Controls -->
     <div>
       <div class="card">
-        <div class="card-title">Model File</div>
+        <div class="card-title">Presets</div>
+          <div class="preset-bar">
+            <select id="preset-sel"><option value="">— saved presets —</option></select>
+            <button class="preset-btn" onclick="loadPreset()">Load</button>
+            <button class="preset-btn del-btn" onclick="deletePreset()">×</button>
+          </div>
+          <button class="preset-btn save-btn" onclick="savePreset()">Save Current Settings as Preset…</button>
+          <div class="card-title">Model File</div>
         <div id="drop-zone">
-          <input type="file" id="file-input" accept=".stl,.obj,.3mf,.amf">
+          <input type="file" id="file-input" accept=".stl,.obj,.3mf,.amf" multiple>
           <div class="drop-icon">📦</div>
           <div class="drop-label"><span>Click to browse</span> or drag & drop</div>
           <div class="drop-label" style="margin-top:.25rem;font-size:.75rem">STL · OBJ · 3MF · AMF</div>
+          <div id="file-queue">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem">
+              <span style="font-size:.7rem;font-weight:700;color:var(--muted);letter-spacing:.08em;text-transform:uppercase">Queue (<span id="queue-count">0</span>)</span>
+              <button class="queue-clear" onclick="clearQueue()">Clear all</button>
+            </div>
+            <div id="queue-list"></div>
+          </div>
           <div id="file-name"></div>
         </div>
 
@@ -1158,7 +1287,13 @@ HTML = """<!DOCTYPE html>
             placeholder="1.0 = no adjustment">
         </div>
 
-        <button id="run-btn" onclick="runQuote()" disabled>Generate Quote</button>
+          <div class="row" style="margin-bottom:0.75rem">
+            <div class="form-group">
+              <label>Farm size <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">printers</span></label>
+              <input type="number" id="farm-size" value="1" min="1" step="1">
+            </div>
+          </div>
+          <button id="run-btn" onclick="runQuote()" disabled>Generate Quote</button>
       </div>
     </div>
 
@@ -1167,6 +1302,13 @@ HTML = """<!DOCTYPE html>
       <div id="placeholder" class="placeholder">
         <div class="placeholder-icon">📐</div>
         <div class="placeholder-text">Upload a model and hit <strong>Generate Quote</strong></div>
+        <div id="batch-results" style="display:none;margin-top:1rem">
+          <div class="card-title" style="margin-bottom:0.5rem">Batch Summary</div>
+          <table class="batch-table">
+            <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th></tr></thead>
+            <tbody id="batch-tbody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div id="results">
@@ -1180,6 +1322,7 @@ HTML = """<!DOCTYPE html>
           <a class="copy-btn" href="/api/export_gcode" style="margin-left:0.4rem;text-decoration:none;padding:0.35rem 0.7rem">Download GCode</a>
         </div>
 
+        <div id="farm-row" class="qty-row" style="display:none;border-color:rgba(108,99,255,.2);background:rgba(108,99,255,.04);margin-bottom:0.75rem"></div>
         <div id="applied-row" class="applied-row"></div>
         <div id="warn-row" class="warn-row" style="display:none"></div>
 
@@ -1232,8 +1375,8 @@ let supportMode = 'none';
 let selectedFile = null;
 
 async function init() {
-  const res = await fetch('/api/printers');
-  const printers = await res.json();
+  const [printersRes] = await Promise.all([fetch('/api/printers'), loadPresetsList()]);
+  const printers = await printersRes.json();
   const sel = document.getElementById('printer-sel');
   sel.innerHTML = '<option value="">— select printer —</option>' +
     printers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
@@ -1294,8 +1437,16 @@ const dropZone  = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
 dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('dragover'); const f = e.dataTransfer.files[0]; if (f) setFile(f); });
-fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+dropZone.addEventListener('drop', e => {
+    e.preventDefault(); dropZone.classList.remove('dragover');
+    const files = Array.from(e.dataTransfer.files).filter(f => /\\.(stl|obj|3mf|amf)$/i.test(f.name));
+    if (files.length) { addFilesToQueue(files); dropZone.classList.add('has-file'); document.getElementById('file-name').textContent = files.length === 1 ? '✓ ' + files[0].name : `✓ ${files.length} files queued`; }
+  });
+fileInput.addEventListener('change', () => {
+    const files = Array.from(fileInput.files);
+    if (files.length) { addFilesToQueue(files); dropZone.classList.add('has-file'); document.getElementById('file-name').textContent = files.length === 1 ? '✓ ' + files[0].name : `✓ ${files.length} files queued`; }
+    fileInput.value = '';
+  });
 
 function setFile(f) {
   selectedFile = f;
@@ -1307,31 +1458,13 @@ function updateRunBtn() {
   document.getElementById('run-btn').disabled = !selectedFile;
 }
 
-async function runQuote() {
-  if (!selectedFile) return;
-  const btn = document.getElementById('run-btn');
-  btn.disabled = true;
+let fileQueue = [];   // {file, status:'pending'|'slicing'|'done'|'error', result}
 
-  const doOrient = document.getElementById('auto-orient').checked;
-  const doSplit  = document.getElementById('auto-split').checked;
-  let statusMsg  = 'Slicing…';
-  if (doOrient && doSplit) statusMsg = 'Orienting & splitting…';
-  else if (doOrient) statusMsg = 'Orienting…';
-  else if (doSplit)  statusMsg = 'Checking size…';
-  btn.innerHTML = `<span class="spinner"></span> ${statusMsg}`;
-
-  document.getElementById('error-box').style.display = 'none';
-  document.getElementById('results').style.display   = 'none';
-  document.getElementById('placeholder').style.display = 'none';
-
+function buildFormData(file) {
   const pp = document.getElementById('print-profile-sel').value;
   const fp = document.getElementById('filament-sel').value;
-  if (pp) localStorage.setItem('lastPrintProfile', pp);
-  if (fp) localStorage.setItem('lastFilament', fp);
-  saveInputs();
-
   const fd = new FormData();
-  fd.append('file',          selectedFile);
+  fd.append('file',          file);
   fd.append('printer',       document.getElementById('printer-sel').value);
   fd.append('print_profile', pp);
   fd.append('filament',      fp);
@@ -1345,21 +1478,138 @@ async function runQuote() {
   fd.append('hourly_rate',   document.getElementById('hourly-rate').value);
   fd.append('markup',        document.getElementById('markup').value);
   fd.append('quantity',      document.getElementById('quantity').value);
-  fd.append('auto_orient',   doOrient ? 'true' : 'false');
-  fd.append('auto_split',    doSplit  ? 'true' : 'false');
+  fd.append('farm_size',     document.getElementById('farm-size').value || '1');
+  fd.append('auto_orient',   document.getElementById('auto-orient').checked ? 'true' : 'false');
+  fd.append('auto_split',    document.getElementById('auto-split').checked  ? 'true' : 'false');
   fd.append('time_factor',   document.getElementById('time-factor').value || '1.0');
+  return fd;
+}
 
+function addFilesToQueue(files) {
+  for (const f of files) fileQueue.push({file: f, status: 'pending', result: null});
+  selectedFile = fileQueue[0]?.file || null;
+  renderQueue();
+  const btn = document.getElementById('run-btn');
+  btn.disabled = false;
+  btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
+}
+
+function renderQueue() {
+  const qDiv = document.getElementById('file-queue');
+  if (fileQueue.length <= 1) { qDiv.style.display = 'none'; return; }
+  qDiv.style.display = 'block';
+  document.getElementById('queue-count').textContent = fileQueue.length;
+  document.getElementById('queue-list').innerHTML = fileQueue.map((item, i) =>
+    `<div class="queue-item st-${item.status}">
+       <span class="queue-fname" title="${esc(item.file.name)}">${esc(item.file.name)}</span>
+       <span class="queue-status st-${item.status}">${item.status}</span>
+     </div>`).join('');
+}
+
+function clearQueue() {
+  fileQueue = []; selectedFile = null;
+  renderQueue();
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.textContent = 'Generate Quote';
+  document.getElementById('file-name').textContent = '';
+  document.getElementById('drop-zone').classList.remove('has-file');
+}
+
+function minsFromStr(s) {
+  if (!s) return 0;
+  let t = 0;
+  for (const [,v,u] of s.matchAll(/(\\d+)\\s*([dhms])/g)) {
+    const n = parseInt(v);
+    if (u==='d') t += n*1440; else if (u==='h') t += n*60;
+    else if (u==='m') t += n; else if (u==='s') t += n/60;
+  }
+  return t;
+}
+
+function minsToStr(m) {
+  const d = Math.floor(m/1440), h = Math.floor((m%1440)/60), mn = Math.floor(m%60);
+  if (d) return `${d}d ${h}h ${mn}m`;
+  if (h) return `${h}h ${mn}m`;
+  return `${mn}m`;
+}
+
+async function runQuote() {
+  if (fileQueue.length > 1) { await runBatch(); return; }
+  if (!selectedFile) return;
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  const doOrient = document.getElementById('auto-orient').checked;
+  const doSplit  = document.getElementById('auto-split').checked;
+  let statusMsg  = 'Slicing…';
+  if (doOrient && doSplit) statusMsg = 'Orienting & splitting…';
+  else if (doOrient) statusMsg = 'Orienting…';
+  else if (doSplit)  statusMsg = 'Checking size…';
+  btn.innerHTML = `<span class="spinner"></span> ${statusMsg}`;
+  document.getElementById('error-box').style.display = 'none';
+  document.getElementById('results').style.display   = 'none';
+  document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('batch-results').style.display = 'none';
+  const pp = document.getElementById('print-profile-sel').value;
+  const fp = document.getElementById('filament-sel').value;
+  if (pp) localStorage.setItem('lastPrintProfile', pp);
+  if (fp) localStorage.setItem('lastFilament', fp);
+  saveInputs();
   try {
-    const res  = await fetch('/api/quote', { method: 'POST', body: fd });
+    const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile) });
     const data = await res.json();
     if (!res.ok) showError(data.error || 'Slicing failed');
     else         showResults(data);
   } catch (e) {
     showError(String(e));
   }
-
   btn.disabled = false;
-  btn.innerHTML = 'Generate Quote';
+  btn.textContent = 'Generate Quote';
+}
+
+async function runBatch() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  document.getElementById('error-box').style.display = 'none';
+  document.getElementById('results').style.display   = 'none';
+  document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('batch-results').style.display = 'none';
+  saveInputs();
+  for (let i = 0; i < fileQueue.length; i++) {
+    const item = fileQueue[i];
+    item.status = 'slicing'; renderQueue();
+    btn.innerHTML = `<span class="spinner"></span> ${i+1}/${fileQueue.length} Quoting…`;
+    try {
+      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file)});
+      const data = await res.json();
+      item.status = res.ok ? 'done' : 'error';
+      item.result = data;
+    } catch(e) {
+      item.status = 'error';
+      item.result = {error: String(e), filename: item.file.name};
+    }
+    renderQueue();
+  }
+  btn.disabled = false;
+  btn.textContent = 'Quote All';
+  showBatchResults();
+}
+
+function showBatchResults() {
+  let totalMins = 0, totalG = 0, totalCost = 0, hasCost = false;
+  const rows = fileQueue.map(item => {
+    const d = item.result;
+    if (!d || d.error) return `<tr><td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d?.filename||item.file.name)}">${esc(d?.filename||item.file.name)}</td><td colspan="3" class="batch-err">${esc(d?.error||'error')}</td></tr>`;
+    const mins = minsFromStr(d.time);
+    totalMins += mins;
+    totalG    += d.weight_g || 0;
+    const cost = d.quote_price ?? d.subtotal ?? null;
+    if (cost != null) { totalCost += cost; hasCost = true; }
+    return `<tr><td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d.filename)}">${esc(d.filename)}</td><td>${esc(d.time||'—')}</td><td>${d.weight_g!=null?d.weight_g+' g':'—'}</td><td>${cost!=null?'$'+cost.toFixed(2):'—'}</td></tr>`;
+  });
+  rows.push(`<tr class="batch-totals"><td>TOTAL (${fileQueue.length})</td><td>${minsToStr(totalMins)}</td><td>${totalG.toFixed(1)} g</td><td>${hasCost?'$'+totalCost.toFixed(2):'—'}</td></tr>`);
+  document.getElementById('batch-tbody').innerHTML = rows.join('');
+  document.getElementById('batch-results').style.display = 'block';
 }
 
 function showResults(d) {
@@ -1455,6 +1705,18 @@ function showResults(d) {
     }
   }
 
+  // Farm time
+  const farmRow = document.getElementById('farm-row');
+  if (d.farm_size > 1 && d.farm_time) {
+    const batches = Math.ceil((d.quantity||1) / d.farm_size);
+    farmRow.textContent = '';
+    farmRow.innerHTML = `<span>Farm · ${d.farm_size} printers · ${batches} batch${batches!==1?'es':''}</span><span>Wall-clock: <strong>${esc(d.farm_time)}</strong></span>`;
+    farmRow.style.display = 'flex';
+    farmRow.style.justifyContent = 'space-between';
+  } else {
+    farmRow.style.display = 'none';
+  }
+
   // Qty row
   const qtyBox = document.getElementById('qty-box');
   if (d.quantity > 1) {
@@ -1494,6 +1756,9 @@ function copyQuote() {
   if (d.markup_pct)            lines.push(`Markup ${d.markup_pct}%: +$${d.markup_amt.toFixed(2)}`);
   if (d.quote_price != null)   lines.push(`\\nQUOTE PRICE: $${d.quote_price.toFixed(2)}`);
   else if (d.subtotal != null) lines.push(`\\nTOTAL COST:  $${d.subtotal.toFixed(2)}`);
+  if (d.farm_size > 1 && d.farm_time) {
+    lines.push(`Farm (${d.farm_size} printers): ${d.farm_time} wall-clock`);
+  }
   if (d.quantity > 1) {
     lines.push('');
     lines.push(`Qty ${d.quantity} — Total time: ${d.qty_time}, Total weight: ${d.qty_weight_g} g`);
@@ -1537,7 +1802,74 @@ async function download3mf() {
   }
 }
 
-const PERSIST_IDS = ['cost-per-kg', 'hourly-rate', 'markup', 'quantity', 'infill', 'layer-height', 'walls', 'time-factor'];
+// ── Presets ──────────────────────────────────────────────────────────────────
+let presetsCache = {};
+
+async function loadPresetsList() {
+  try {
+    const res = await fetch('/api/presets');
+    presetsCache = await res.json();
+  } catch { presetsCache = {}; }
+  const sel = document.getElementById('preset-sel');
+  sel.innerHTML = '<option value="">— saved presets —</option>' +
+    Object.keys(presetsCache).sort().map(n =>
+      `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+}
+
+function loadPreset() {
+  const name = document.getElementById('preset-sel').value;
+  if (!name || !presetsCache[name]) return;
+  const s = presetsCache[name];
+  const printerSel = document.getElementById('printer-sel');
+  const applyProfiles = () => {
+    if (s.print_profile) document.getElementById('print-profile-sel').value = s.print_profile;
+    if (s.filament)      document.getElementById('filament-sel').value = s.filament;
+  };
+  if (s.printer && printerSel.value !== s.printer) {
+    printerSel.value = s.printer;
+    loadProfiles().then(applyProfiles);
+  } else { applyProfiles(); }
+  if (s.infill)       document.getElementById('infill').value = s.infill;
+  if (s.layer_height) document.getElementById('layer-height').value = s.layer_height;
+  if (s.walls)        document.getElementById('walls').value = s.walls;
+  if (s.supports)     setSupportMode(s.supports);
+  if (s.cost_per_kg)  document.getElementById('cost-per-kg').value = s.cost_per_kg;
+  if (s.hourly_rate)  document.getElementById('hourly-rate').value = s.hourly_rate;
+  if (s.markup)       document.getElementById('markup').value = s.markup;
+  if (s.farm_size)    document.getElementById('farm-size').value = s.farm_size;
+}
+
+async function savePreset() {
+  const name = prompt('Preset name:');
+  if (!name || !name.trim()) return;
+  const body = {
+    name:          name.trim(),
+    printer:       document.getElementById('printer-sel').value,
+    print_profile: document.getElementById('print-profile-sel').value,
+    filament:      document.getElementById('filament-sel').value,
+    infill:        document.getElementById('infill').value,
+    layer_height:  document.getElementById('layer-height').value,
+    walls:         document.getElementById('walls').value,
+    supports:      supportMode,
+    cost_per_kg:   document.getElementById('cost-per-kg').value,
+    hourly_rate:   document.getElementById('hourly-rate').value,
+    markup:        document.getElementById('markup').value,
+    farm_size:     document.getElementById('farm-size').value,
+  };
+  await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  await loadPresetsList();
+  document.getElementById('preset-sel').value = body.name;
+}
+
+async function deletePreset() {
+  const name = document.getElementById('preset-sel').value;
+  if (!name) return;
+  if (!confirm(`Delete preset "${name}"?`)) return;
+  await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
+  await loadPresetsList();
+}
+
+const PERSIST_IDS = ['cost-per-kg', 'hourly-rate', 'markup', 'quantity', 'infill', 'layer-height', 'walls', 'time-factor', 'farm-size'];
 function saveInputs() {
   for (const id of PERSIST_IDS) { const el = document.getElementById(id); if (el && el.value) localStorage.setItem('input_' + id, el.value); }
 }
