@@ -721,19 +721,70 @@ def api_check_size():
 
         # Mesh health checks via trimesh (best-effort)
         mesh_warnings = []
+        file_size = os.path.getsize(input_path)
+        if file_size > 100 * 1024 * 1024:
+            mesh_warnings.append(f"Large file ({file_size / 1024 / 1024:.0f} MB) — upload and slicing will be slow.")
         try:
             import trimesh as tm
+            import numpy as np
             mesh = tm.load(input_path, force="mesh")
             if mesh.is_empty or len(mesh.faces) == 0:
                 mesh_warnings.append("Empty mesh — file may be corrupted or contain no geometry.")
             else:
+                # Watertightness
                 if not mesh.is_watertight:
                     mesh_warnings.append("Mesh is not watertight (open holes detected) — may cause slicing errors or missing surfaces.")
+
+                # Winding / normals consistency
+                if not mesh.is_winding_consistent:
+                    mesh_warnings.append("Inconsistent face normals — some faces may be inverted, causing surfaces to appear hollow or missing.")
+
+                # Geometry below build plate
                 if mesh.bounds is not None and mesh.bounds[0][2] < -0.01:
                     mesh_warnings.append(f"Geometry below Z=0 ({mesh.bounds[0][2]:.1f} mm) — part of the model will be cut off by the build plate.")
+
+                # Very small model (possible wrong units)
+                max_ext = float(mesh.extents.max())
+                if max_ext < 5.0:
+                    mesh_warnings.append(f"Model is very small (largest dimension: {max_ext:.2f} mm) — check units (may need to scale from inches or cm).")
+
+                # Thin features
+                min_ext = float(mesh.extents.min())
+                if min_ext < 0.5:
+                    mesh_warnings.append(f"Extremely thin in one axis ({min_ext:.2f} mm) — likely unprintable at this scale.")
+                elif min_ext < 2.0:
+                    mesh_warnings.append(f"Very thin wall ({min_ext:.1f} mm) — check wall thickness against nozzle diameter.")
+
+                # High aspect ratio (tipping risk)
+                if min_ext > 0:
+                    ratio = max_ext / min_ext
+                    if ratio > 15:
+                        mesh_warnings.append(f"High aspect ratio ({ratio:.0f}:1) — tall or narrow models risk tipping mid-print; consider a brim or supports.")
+
+                # Multiple separate bodies
+                try:
+                    bodies = mesh.split(only_watertight=False)
+                    n = len(bodies)
+                    if n > 1:
+                        mesh_warnings.append(f"{n} separate bodies in file — each will be placed individually; verify all fit on the build plate.")
+                except Exception:
+                    pass
+
+                # Degenerate (zero-area) faces
+                try:
+                    degenerate = int((mesh.area_faces < 1e-6).sum())
+                    if degenerate > 100:
+                        mesh_warnings.append(f"{degenerate:,} degenerate (zero-area) faces — mesh may be corrupted; consider repair before slicing.")
+                except Exception:
+                    pass
+
+                # High polygon count
                 face_count = len(mesh.faces)
                 if face_count > 2_000_000:
-                    mesh_warnings.append(f"Very high polygon count ({face_count:,} faces) — slicing may be slow.")
+                    mesh_warnings.append(f"Very high polygon count ({face_count:,} faces) — consider decimating before slicing.")
+                elif face_count > 500_000:
+                    mesh_warnings.append(f"High polygon count ({face_count:,} faces) — slicing may be slow.")
+
         except Exception:
             pass  # trimesh unavailable or can't parse — skip health checks
 
@@ -1849,35 +1900,68 @@ async function runQuote() {
   if (!selectedFile) return;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
+  document.getElementById('error-box').style.display    = 'none';
+  document.getElementById('results').style.display      = 'none';
+  document.getElementById('placeholder').style.display  = 'none';
+  document.getElementById('batch-results').style.display = 'none';
+  document.getElementById('preflight-panel').style.display = 'none';
+  saveInputs();
+
+  // Pre-flight check
+  const s = getFormSettings();
+  if (s.printer) {
+    btn.innerHTML = `<span class="spinner"></span> Checking…`;
+    try {
+      const fd = new FormData();
+      fd.append('file', selectedFile);
+      fd.append('printer', s.printer);
+      const res  = await fetch('/api/check_size', {method:'POST', body:fd});
+      const data = await res.json();
+      const hasIssues = data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0);
+      if (hasIssues) {
+        const tempItem = {file: selectedFile, sizeCheck: data, sizeOverride: 'warn', settings: s};
+        window._preflightOversized = [tempItem];
+        window._preflightCallback  = async () => { await _doSingleQuote(tempItem.sizeOverride); };
+        _renderPreflightList([tempItem]);
+        document.getElementById('preflight-panel').style.display = 'block';
+        btn.disabled    = false;
+        btn.textContent = 'Generate Quote';
+        return;
+      }
+    } catch(e) { console.warn('Pre-flight check failed', e); }
+  }
+
+  await _doSingleQuote();
+}
+
+async function _doSingleQuote(sizeOverride) {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
   const doOrient = document.getElementById('auto-orient').checked;
   const doSplit  = document.getElementById('auto-split').checked;
   let statusMsg  = 'Slicing…';
   if (doOrient && doSplit) statusMsg = 'Orienting & splitting…';
   else if (doOrient) statusMsg = 'Orienting…';
-  else if (doSplit)  statusMsg = 'Checking size…';
+  else if (doSplit)  statusMsg = 'Splitting…';
   btn.innerHTML = `<span class="spinner"></span> ${statusMsg}`;
-  document.getElementById('error-box').style.display = 'none';
-  document.getElementById('results').style.display   = 'none';
-  document.getElementById('placeholder').style.display = 'none';
-  document.getElementById('batch-results').style.display = 'none';
   const pp = document.getElementById('print-profile-sel').value;
   const fp = document.getElementById('filament-sel').value;
   if (pp) localStorage.setItem('lastPrintProfile', pp);
   if (fp) localStorage.setItem('lastFilament', fp);
-  saveInputs();
   try {
-    const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile) });
+    const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile, null, sizeOverride) });
     const data = await res.json();
     if (!res.ok) {
       const errMsg = (data.overflow_warning ? data.overflow_warning + '\\n\\n' : '') + (data.error || 'Slicing failed');
       showError(errMsg);
     } else {
+      if (fileQueue.length === 1) { fileQueue[0].status = 'done'; fileQueue[0].result = data; renderQueue(); }
       showResults(data);
     }
   } catch (e) {
     showError(String(e));
   }
-  btn.disabled = false;
+  btn.disabled    = false;
   btn.textContent = 'Generate Quote';
 }
 
@@ -1913,39 +1997,11 @@ async function runBatch() {
       } catch(e) { console.warn('Size check failed for', item.file.name, e); }
     }
     if (oversized.length > 0) {
-      // Show pre-flight panel and stop — user must confirm
-      const listEl = document.getElementById('preflight-list');
-      listEl.innerHTML = oversized.map((item, idx) => {
-        const sc = item.sizeCheck;
-        const sz = sc.size ? `${sc.size.x}×${sc.size.y}×${sc.size.z} mm` : '';
-        const bv = sc.build_vol ? `build volume: ${sc.build_vol.x}×${sc.build_vol.y}×${sc.build_vol.z} mm` : '';
-        const ov = item.sizeOverride || 'warn';
-        const parseFailed = sc.parse_failed === true;
-        const hasOverflow = !!sc.overflow_warning;
-        const meshWarns = sc.mesh_warnings || [];
-        const meshWarnHtml = meshWarns.length
-          ? `<div class="pf-mesh-warns">${meshWarns.map(w => `<div class="pf-mesh-warn">⚠ ${esc(w)}</div>`).join('')}</div>`
-          : '';
-        const sizeActions = parseFailed
-          ? `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`
-          : `<button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
-            <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
-            <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
-        const actions = hasOverflow || parseFailed ? sizeActions
-          : `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
-        return `<div class="preflight-file" id="pf-${idx}">
-          <div class="preflight-info">
-            <strong>${esc(item.file.name)}</strong>${sc.overflow_warning ? ' — ' + esc(sc.overflow_warning) : ''}
-            <small>${sz}${bv ? ' · ' + bv : ''}</small>
-            ${meshWarnHtml}
-          </div>
-          <div class="preflight-actions">${actions}</div>
-        </div>`;
-      }).join('');
-      // Store reference to oversized items for confirmPreflight
       window._preflightOversized = oversized;
+      window._preflightCallback  = async () => { await _runBatchSlice(); };
+      _renderPreflightList(oversized);
       document.getElementById('preflight-panel').style.display = 'block';
-      btn.disabled = false;
+      btn.disabled    = false;
       btn.textContent = 'Quote All';
       return;  // wait for user to click "Continue & Quote"
     }
@@ -1954,19 +2010,52 @@ async function runBatch() {
   await _runBatchSlice();
 }
 
+function _renderPreflightList(items) {
+  document.getElementById('preflight-list').innerHTML = items.map((item, idx) => {
+    const sc = item.sizeCheck;
+    const sz = sc.size ? `${sc.size.x}×${sc.size.y}×${sc.size.z} mm` : '';
+    const bv = sc.build_vol ? `build vol: ${sc.build_vol.x}×${sc.build_vol.y}×${sc.build_vol.z} mm` : '';
+    const ov = item.sizeOverride || 'warn';
+    const parseFailed = sc.parse_failed === true;
+    const hasOverflow = !!sc.overflow_warning;
+    const meshWarns   = sc.mesh_warnings || [];
+    const meshWarnHtml = meshWarns.length
+      ? `<div class="pf-mesh-warns">${meshWarns.map(w => `<div class="pf-mesh-warn">⚠ ${esc(w)}</div>`).join('')}</div>`
+      : '';
+    const sizeActions = parseFailed
+      ? `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`
+      : `<button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
+         <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
+         <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
+    const actions = (hasOverflow || parseFailed) ? sizeActions
+      : `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
+    return `<div class="preflight-file" id="pf-${idx}">
+      <div class="preflight-info">
+        <strong>${esc(item.file.name)}</strong>${sc.overflow_warning ? ' — ' + esc(sc.overflow_warning) : ''}
+        <small>${sz}${bv ? ' · ' + bv : ''}</small>
+        ${meshWarnHtml}
+      </div>
+      <div class="preflight-actions">${actions}</div>
+    </div>`;
+  }).join('');
+}
+
 function setPfOverride(idx, val) {
   const item = window._preflightOversized[idx];
   item.sizeOverride = val;
-  // Update button active states
   const row = document.getElementById(`pf-${idx}`);
   row.querySelectorAll('.pf-btn').forEach(b => b.classList.remove('active'));
-  const labels = ['scale_fit','split','warn'];
-  row.querySelectorAll('.pf-btn').forEach((b,i) => b.classList.toggle('active', labels[i]===val));
+  row.querySelectorAll('.pf-btn').forEach(b => {
+    if (b.textContent.trim() === ({scale_fit:'Scale to Fit', split:'Auto-Split', warn:'Quote Anyway'}[val])) b.classList.add('active');
+  });
 }
 
 async function confirmPreflight() {
   document.getElementById('preflight-panel').style.display = 'none';
-  await _runBatchSlice();
+  const cb = window._preflightCallback;
+  window._preflightCallback = null;
+  if (cb) await cb();
+  else await _runBatchSlice();
 }
 
 async function _runBatchSlice() {
