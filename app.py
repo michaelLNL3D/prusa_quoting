@@ -31,6 +31,7 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # Last-job state for 3MF export (in-memory, single-user tool)
 _last_job = {}   # {input_path, printer, print_prof, filament, infill, layer_h, walls, supports, size_val, size_mode, filename}
+_jobs     = {}   # job_id -> {gcode_paths, filename}  (last 50 jobs)
 
 app = Flask(__name__)
 
@@ -853,8 +854,15 @@ def api_quote():
         batches   = _math.ceil(quantity / farm_size)
         farm_time = mins_to_str(total_mins * batches)
 
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())[:8]
+    _jobs[job_id] = {"gcode_paths": gcode_paths, "filename": file.filename}
+    if len(_jobs) > 50:
+        del _jobs[next(iter(_jobs))]
+
     return jsonify({
         "filename":       file.filename,
+        "job_id":         job_id,
         "printer":        printer,
         "print_profile":  print_prof,
         "filament":       filament,
@@ -938,14 +946,16 @@ def api_export_ini():
 
 @app.route("/api/export_gcode")
 def api_export_gcode():
-    """Download sliced gcode(s) for the last quote. Single piece → .gcode, multiple → .zip."""
+    """Download sliced gcode(s). Pass ?job_id=xxx for a specific quote, or omit for the last one."""
     import zipfile, io
-    gcode_paths = _last_job.get("gcode_paths", [])
+    job_id = request.args.get("job_id")
+    job = (_jobs.get(job_id) if job_id else None) or _last_job
+    gcode_paths = job.get("gcode_paths", [])
     gcode_paths = [(lbl, p) for lbl, p in gcode_paths if os.path.exists(p)]
     if not gcode_paths:
         return jsonify({"error": "No gcode — run a quote first"}), 400
 
-    stem = Path(_last_job.get("filename", "quote")).stem
+    stem = Path(job.get("filename", "quote")).stem
 
     if len(gcode_paths) == 1:
         lbl, path = gcode_paths[0]
@@ -1311,7 +1321,7 @@ HTML = """<!DOCTYPE html>
       <div id="batch-results" style="display:none;margin-top:1rem">
         <div class="card-title" style="margin-bottom:0.5rem">Batch Summary</div>
         <table class="batch-table">
-          <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th></tr></thead>
+          <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th><th></th></tr></thead>
           <tbody id="batch-tbody"></tbody>
         </table>
       </div>
@@ -1536,8 +1546,10 @@ function deleteQueueItem(i) {
   selectedFile = fileQueue[0]?.file || null;
   renderQueue();
   const btn = document.getElementById('run-btn');
-  btn.disabled  = fileQueue.length === 0;
+  btn.disabled    = false;
   btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
+  // If one done item remains, show its result right away
+  if (fileQueue.length === 1 && fileQueue[0].status === 'done') showResults(fileQueue[0].result);
 }
 
 function buildFormData(file, settings) {
@@ -1578,13 +1590,18 @@ function renderQueue() {
   if (fileQueue.length <= 1) { qDiv.style.display = 'none'; return; }
   qDiv.style.display = 'block';
   document.getElementById('queue-count').textContent = fileQueue.length;
-  document.getElementById('queue-list').innerHTML = fileQueue.map((item, i) =>
-    `<div class="queue-item st-${item.status}${selectedQueueIdx===i?' selected':''}" onclick="selectQueueItem(${i})">
+  document.getElementById('queue-list').innerHTML = fileQueue.map((item, i) => {
+    const dlBtn = (item.status === 'done' && item.result?.job_id)
+      ? `<a class="queue-del" href="/api/export_gcode?job_id=${item.result.job_id}" onclick="event.stopPropagation()" title="Download GCode" style="color:var(--accent2);text-decoration:none">↓</a>`
+      : '';
+    return `<div class="queue-item st-${item.status}${selectedQueueIdx===i?' selected':''}" onclick="selectQueueItem(${i})">
        <span class="queue-fname" title="${esc(item.file.name)}">${esc(item.file.name)}</span>
        ${item.settings ? '<span class="queue-badge" title="Custom settings">⚙</span>' : ''}
        <span class="queue-status st-${item.status}">${item.status}</span>
+       ${dlBtn}
        <button class="queue-del" title="Remove" onclick="event.stopPropagation();deleteQueueItem(${i})">×</button>
-     </div>`).join('');
+     </div>`;
+  }).join('');
 }
 
 function clearQueue() {
@@ -1617,6 +1634,10 @@ function minsToStr(m) {
 
 async function runQuote() {
   if (fileQueue.length > 1) { await runBatch(); return; }
+  // Single file already quoted — show cached result, no re-slice
+  if (fileQueue.length === 1 && fileQueue[0].status === 'done') {
+    showResults(fileQueue[0].result); return;
+  }
   if (!selectedFile) return;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
@@ -1685,15 +1706,18 @@ function showBatchResults() {
   let totalMins = 0, totalG = 0, totalCost = 0, hasCost = false;
   const rows = fileQueue.map(item => {
     const d = item.result;
-    if (!d || d.error) return `<tr><td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d?.filename||item.file.name)}">${esc(d?.filename||item.file.name)}</td><td colspan="3" class="batch-err">${esc(d?.error||'error')}</td></tr>`;
+    const fname = d?.filename || item.file.name;
+    const fnCell = `<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(fname)}">${esc(fname)}</td>`;
+    if (!d || d.error) return `<tr>${fnCell}<td colspan="3" class="batch-err">${esc(d?.error||'error')}</td><td>—</td></tr>`;
     const mins = minsFromStr(d.time);
     totalMins += mins;
     totalG    += d.weight_g || 0;
     const cost = d.quote_price ?? d.subtotal ?? null;
     if (cost != null) { totalCost += cost; hasCost = true; }
-    return `<tr><td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d.filename)}">${esc(d.filename)}</td><td>${esc(d.time||'—')}</td><td>${d.weight_g!=null?d.weight_g+' g':'—'}</td><td>${cost!=null?'$'+cost.toFixed(2):'—'}</td></tr>`;
+    const dlLink = d.job_id ? `<a href="/api/export_gcode?job_id=${d.job_id}" title="Download GCode" style="color:var(--accent2);text-decoration:none;font-size:1rem">↓</a>` : '—';
+    return `<tr>${fnCell}<td>${esc(d.time||'—')}</td><td>${d.weight_g!=null?d.weight_g+' g':'—'}</td><td>${cost!=null?'$'+cost.toFixed(2):'—'}</td><td>${dlLink}</td></tr>`;
   });
-  rows.push(`<tr class="batch-totals"><td>TOTAL (${fileQueue.length})</td><td>${minsToStr(totalMins)}</td><td>${totalG.toFixed(1)} g</td><td>${hasCost?'$'+totalCost.toFixed(2):'—'}</td></tr>`);
+  rows.push(`<tr class="batch-totals"><td>TOTAL (${fileQueue.length})</td><td>${minsToStr(totalMins)}</td><td>${totalG.toFixed(1)} g</td><td>${hasCost?'$'+totalCost.toFixed(2):'—'}</td><td></td></tr>`);
   document.getElementById('batch-tbody').innerHTML = rows.join('');
   document.getElementById('batch-results').style.display = 'block';
 }
