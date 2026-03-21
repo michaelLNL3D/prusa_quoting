@@ -38,6 +38,21 @@ _jobs     = {}   # job_id -> {gcode_paths, filename}  (last 50 jobs)
 # In-memory error log (last 100 entries)
 _error_log = []
 
+# In-memory progress tracking: pid -> list of {label, status, detail}
+_progress = {}
+
+def _emit(pid, label, status, detail=None):
+    """Emit a progress step. If a step with the same label exists, update it in-place."""
+    if not pid:
+        return
+    steps = _progress.setdefault(pid, [])
+    for s in reversed(steps):
+        if s["label"] == label:
+            s["status"] = status
+            s["detail"] = detail or ""
+            return
+    steps.append({"label": label, "status": status, "detail": detail or ""})
+
 def _log_error(endpoint, error, tb=None, params=None):
     _error_log.append({
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -705,6 +720,16 @@ def api_debug_log_clear():
     return jsonify({"ok": True})
 
 
+@app.route("/api/progress/<pid>", methods=["GET"])
+def api_progress_get(pid):
+    return jsonify(_progress.get(pid, []))
+
+@app.route("/api/progress/<pid>", methods=["DELETE"])
+def api_progress_delete(pid):
+    _progress.pop(pid, None)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/check_size", methods=["POST"])
 def api_check_size():
     """Quick bounding-box + mesh health check — no slicing."""
@@ -832,8 +857,10 @@ def api_quote():
     do_orient     = form.get("auto_orient")    == "true"
     do_split      = form.get("auto_split")     == "true"
     do_scale_fit  = form.get("auto_scale_fit") == "true"
+    pid           = form.get("progress_id", "")
 
     suffix = Path(file.filename).suffix.lower()
+    _emit(pid, "Saving file", "done", file.filename)
 
     # Save a persistent copy for 3MF export
     import shutil
@@ -867,6 +894,7 @@ def api_quote():
         overflow_warning = None   # set if model exceeds build volume
 
         if printer:
+            _emit(pid, "Loading printer profile", "done", printer)
             build_vol = get_build_volume(printer)
 
             # Apply size transform before checking fit
@@ -879,7 +907,10 @@ def api_quote():
                     size_val  = ""  # already applied, don't re-apply during slice
 
             # Always check overflow so we can warn even when auto-split is off
+            _emit(pid, "Checking mesh bounds", "running")
             sx, sy, sz = get_mesh_bounds(work_path)
+            _emit(pid, "Checking mesh bounds", "done",
+                  f"{sx:.0f}×{sy:.0f}×{sz:.0f} mm" if sx else "could not read")
             if sx is not None:
                 over = []
                 if sx > build_vol["x"]: over.append(f"X {sx:.0f} > {build_vol['x']:.0f} mm")
@@ -887,45 +918,55 @@ def api_quote():
                 if sz > build_vol["z"]: over.append(f"Z {sz:.0f} > {build_vol['z']:.0f} mm")
                 if over:
                     if do_scale_fit:
-                        # Use PrusaSlicer's --scale-to-fit so it respects its own internal
-                        # printer limits. Pass 95% of our detected build volume as the target.
                         fit_x = build_vol["x"] * 0.95
                         fit_y = build_vol["y"] * 0.95
                         fit_z = build_vol["z"] * 0.95
                         overflow_warning = f"Model scaled to fit build volume ({', '.join(over)})."
                         if do_orient:
+                            _emit(pid, "Auto-orienting", "running")
                             work_path, orient_note = auto_orient(work_path, tmpdir)
+                            _emit(pid, "Auto-orienting", "done", orient_note)
+                        _emit(pid, "Scaling to fit build volume", "done", f"target {fit_x:.0f}×{fit_y:.0f}×{fit_z:.0f} mm")
                         pieces = [(work_path, "whole")]
-                        # Override size settings so slice_piece uses --scale-to-fit
                         size_val  = f"{fit_x:.0f},{fit_y:.0f},{fit_z:.0f}"
                         size_mode = "fit"
                     elif do_split:
-                        # Split at center of overflowing axis; orient each piece if requested
                         overflow_warning = f"Model too large ({', '.join(over)}), auto-split into pieces."
+                        _emit(pid, "Splitting model", "running", ', '.join(over))
                         pieces = split_if_needed(work_path, build_vol, tmpdir, do_orient=do_orient)
+                        _emit(pid, "Splitting model", "done", f"{len(pieces)} piece{'s' if len(pieces)!=1 else ''}")
                         if do_orient:
                             orient_note = "each piece auto-oriented"
                     else:
                         overflow_warning = f"Model exceeds build volume ({', '.join(over)}). Enable Auto-Split or Scale to Fit."
-                        # Still auto-orient the single piece if requested
                         if do_orient:
+                            _emit(pid, "Auto-orienting", "running")
                             work_path, orient_note = auto_orient(work_path, tmpdir)
+                            _emit(pid, "Auto-orienting", "done", orient_note)
                         pieces = [(work_path, "whole")]
                 else:
-                    # Fits — auto-orient if requested
                     if do_orient:
+                        _emit(pid, "Auto-orienting", "running")
                         work_path, orient_note = auto_orient(work_path, tmpdir)
+                        _emit(pid, "Auto-orienting", "done", orient_note)
                     pieces = [(work_path, "whole")]
             elif do_split:
+                _emit(pid, "Splitting model", "running")
                 pieces = split_if_needed(work_path, build_vol, tmpdir, do_orient=do_orient)
+                _emit(pid, "Splitting model", "done", f"{len(pieces)} piece{'s' if len(pieces)!=1 else ''}")
                 if do_orient:
                     orient_note = "each piece auto-oriented"
             else:
+                if do_orient:
+                    _emit(pid, "Auto-orienting", "running")
+                    work_path, orient_note = auto_orient(work_path, tmpdir)
+                    _emit(pid, "Auto-orienting", "done", orient_note)
                 pieces = [(work_path, "whole")]
         else:
-            # No printer selected — just orient if requested
             if do_orient:
+                _emit(pid, "Auto-orienting", "running")
                 work_path, orient_note = auto_orient(work_path, tmpdir)
+                _emit(pid, "Auto-orienting", "done", orient_note)
             pieces = [(work_path, "whole")]
 
         # ── Build machine-limits-only ini for user printer profiles (e.g. Klipper) ─
@@ -951,8 +992,12 @@ def api_quote():
         errors_out    = []
 
         gcode_paths = []   # (label, path) for all successfully sliced pieces
+        n_pieces = len(pieces)
         for idx, (piece_path, piece_label) in enumerate(pieces):
             persistent_gcode = os.path.join(EXPORT_DIR, f"{job_id}_piece_{idx}.gcode")
+            step_label = f"Slicing {piece_label}" if n_pieces > 1 else "Slicing"
+            counter    = f"{idx+1} of {n_pieces}" if n_pieces > 1 else ""
+            _emit(pid, step_label, "running", counter)
             try:
                 stats = slice_piece(
                     piece_path, tmpdir, idx,
@@ -961,9 +1006,14 @@ def api_quote():
                     machine_limits_ini=machine_limits_ini,
                     persistent_gcode_path=persistent_gcode,
                 )
+                t = stats.get("time_normal", "")
+                g = sum(stats.get("filament_g", [])) or None
+                detail = " · ".join(filter(None, [t, f"{g:.1f} g" if g else ""]))
+                _emit(pid, step_label, "done", detail)
                 piece_results.append({"label": piece_label, "stats": stats})
                 gcode_paths.append((piece_label, persistent_gcode))
             except RuntimeError as e:
+                _emit(pid, step_label, "error", str(e))
                 errors_out.append(f"{piece_label}: {e}")
 
         _last_job["gcode_paths"] = gcode_paths
@@ -974,6 +1024,7 @@ def api_quote():
                 "overflow_warning": overflow_warning,
             }), 500
 
+    _emit(pid, "Calculating quote", "running")
     # ── Aggregate stats ───────────────────────────────────────────────────────
     total_mins   = 0.0
     total_g      = 0.0
@@ -1027,6 +1078,9 @@ def api_quote():
     if farm_size > 1 and total_mins > 0:
         batches   = _math.ceil(quantity / farm_size)
         farm_time = mins_to_str(total_mins * batches)
+
+    price_str = f"${quote_price:.2f}" if quote_price else (f"${subtotal:.2f}" if subtotal else "")
+    _emit(pid, "Calculating quote", "done", price_str)
 
     _jobs[job_id] = {"gcode_paths": gcode_paths, "filename": file.filename}
     if len(_jobs) > 50:
@@ -1351,6 +1405,42 @@ HTML = """<!DOCTYPE html>
   .preflight-confirm:hover { opacity:.88; }
   .pf-mesh-warns { margin-top:0.4rem; display:flex; flex-direction:column; gap:0.2rem; }
   .pf-mesh-warn { font-size:0.72rem; color:var(--warn); opacity:.9; }
+  /* Progress panel */
+  #progress-panel { display:none; }
+  .progress-header { display:flex; align-items:baseline; gap:0.5rem; margin-bottom:0.75rem; }
+  .progress-title { font-size:0.8rem; font-weight:700; color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .progress-subtitle { font-size:0.72rem; color:var(--muted); }
+  .progress-bar-track { height:4px; background:var(--border); border-radius:2px; margin-bottom:1rem; overflow:hidden; }
+  .progress-bar-fill { height:100%; width:100%; background:linear-gradient(90deg,var(--accent),var(--accent2)); border-radius:2px; animation:progress-sweep 1.8s ease-in-out infinite; transform-origin:left; }
+  @keyframes progress-sweep { 0%{transform:scaleX(0.05) translateX(0%)} 50%{transform:scaleX(0.6) translateX(60%)} 100%{transform:scaleX(0.05) translateX(1800%)} }
+  .progress-steps { display:flex; flex-direction:column; gap:0.3rem; }
+  .progress-step { display:flex; align-items:baseline; gap:0.5rem; font-size:0.78rem; }
+  .progress-step-icon { flex-shrink:0; width:1rem; text-align:center; }
+  .progress-step-running .progress-step-icon { animation:spin .8s linear infinite; display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .progress-step-done .progress-step-icon { color:var(--success); }
+  .progress-step-error .progress-step-icon { color:var(--danger); }
+  .progress-step-running { color:var(--text); }
+  .progress-step-done { color:var(--muted); }
+  .progress-step-error { color:var(--danger); }
+  .progress-step-label { flex:1; }
+  .progress-step-detail { color:var(--muted); font-size:0.72rem; margin-left:0.25rem; }
+  /* Right-column tabs */
+  .rc-tabs { display:flex; gap:0.4rem; margin-bottom:1rem; }
+  .rc-tab { font-size:0.7rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; padding:0.3rem 0.75rem; border-radius:6px; border:1px solid var(--border); background:transparent; color:var(--muted); cursor:pointer; transition:all .15s; }
+  .rc-tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .rc-tab.has-warn { border-color:var(--warn); color:var(--warn); }
+  .rc-tab.active.has-warn { background:var(--warn); border-color:var(--warn); color:#000; }
+  /* Health tab */
+  #health-panel { display:none; }
+  .health-file { margin-bottom:1rem; padding:0.75rem; background:var(--input-bg); border-radius:8px; border:1px solid var(--border); }
+  .health-file.has-issues { border-color:rgba(255,169,77,.35); }
+  .health-filename { font-size:0.82rem; font-weight:700; color:var(--text); margin-bottom:0.35rem; display:flex; align-items:center; gap:0.4rem; }
+  .health-dims { font-size:0.72rem; color:var(--muted); margin-bottom:0.35rem; }
+  .health-ok { font-size:0.75rem; color:var(--success); }
+  .health-warn { font-size:0.75rem; color:var(--warn); margin-bottom:0.15rem; }
+  .health-err  { font-size:0.75rem; color:var(--danger); margin-bottom:0.15rem; }
+  .health-empty { color:var(--muted); font-size:0.8rem; text-align:center; padding:2rem; }
   /* Debug panel */
   #debug-btn { position:fixed; bottom:1.2rem; right:1.2rem; z-index:900; background:var(--surface); border:1px solid var(--border); color:var(--muted); font-size:0.72rem; font-weight:700; padding:0.4rem 0.75rem; border-radius:20px; cursor:pointer; letter-spacing:.05em; transition:all .15s; }
   #debug-btn:hover { border-color:var(--accent); color:var(--accent); }
@@ -1541,6 +1631,21 @@ HTML = """<!DOCTYPE html>
 
     <!-- Right: Results -->
     <div class="card" id="results-card">
+      <div class="rc-tabs" id="rc-tabs" style="display:none">
+        <button class="rc-tab active" id="tab-quote" onclick="switchRcTab('quote')">Quote</button>
+        <button class="rc-tab" id="tab-health" onclick="switchRcTab('health')">Health</button>
+      </div>
+
+      <!-- Progress panel -->
+      <div id="progress-panel">
+        <div class="progress-header">
+          <div class="progress-title" id="progress-title">Quoting…</div>
+          <div class="progress-subtitle" id="progress-subtitle"></div>
+        </div>
+        <div class="progress-bar-track"><div class="progress-bar-fill"></div></div>
+        <div class="progress-steps" id="progress-steps"></div>
+      </div>
+
       <div id="placeholder" class="placeholder">
         <div class="placeholder-icon">📐</div>
         <div class="placeholder-text">Upload a model and hit <strong>Generate Quote</strong></div>
@@ -1558,6 +1663,12 @@ HTML = """<!DOCTYPE html>
           <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th><th>GCode</th></tr></thead>
           <tbody id="batch-tbody"></tbody>
         </table>
+      </div>
+
+      <!-- Health tab -->
+      <div id="health-panel">
+        <div class="card-title" style="margin-bottom:0.75rem">File Health Report</div>
+        <div id="health-list"><div class="health-empty">Run a pre-flight check to see results.</div></div>
       </div>
 
       <div id="results">
@@ -1805,7 +1916,113 @@ function deleteQueueItem(i) {
   }
 }
 
-function buildFormData(file, settings, sizeOverride) {
+function makePid() { return Math.random().toString(36).slice(2,12); }
+
+// ── Progress panel ────────────────────────────────────────────────────────────
+let _pollTimer = null;
+let _activePid = null;
+
+function showProgressPanel(title, subtitle) {
+  document.getElementById('progress-title').textContent   = title;
+  document.getElementById('progress-subtitle').textContent = subtitle || '';
+  document.getElementById('progress-steps').innerHTML = '';
+  document.getElementById('progress-panel').style.display  = 'block';
+  document.getElementById('results').style.display         = 'none';
+  document.getElementById('batch-results').style.display   = 'none';
+  document.getElementById('placeholder').style.display     = 'none';
+  document.getElementById('preflight-panel').style.display = 'none';
+  document.getElementById('health-panel').style.display    = 'none';
+  document.getElementById('error-box').style.display       = 'none';
+  document.getElementById('rc-tabs').style.display         = 'none';
+}
+
+function hideProgressPanel() {
+  document.getElementById('progress-panel').style.display = 'none';
+  stopProgressPoll();
+}
+
+function startProgressPoll(pid) {
+  _activePid = pid;
+  _pollTimer = setInterval(async () => {
+    try {
+      const res  = await fetch(`/api/progress/${pid}`);
+      const steps = await res.json();
+      renderServerSteps(steps);
+    } catch(e) {}
+  }, 350);
+}
+
+function stopProgressPoll() {
+  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+  if (_activePid) {
+    const pid = _activePid; _activePid = null;
+    setTimeout(() => fetch(`/api/progress/${pid}`, {method:'DELETE'}).catch(()=>{}), 3000);
+  }
+}
+
+let _clientSteps = [];
+
+function addProgressStep(label, status, detail) {
+  const existing = _clientSteps.find(s => s.label === label);
+  if (existing) { existing.status = status; existing.detail = detail || ''; }
+  else _clientSteps.push({label, status, detail: detail || ''});
+  renderServerSteps([]);  // re-render with current server steps
+}
+
+function renderServerSteps(serverSteps) {
+  const all = [..._clientSteps, ...serverSteps];
+  document.getElementById('progress-steps').innerHTML = all.map(s => {
+    const icon   = s.status === 'done' ? '✓' : s.status === 'error' ? '✗' : s.status === 'running' ? '↻' : '○';
+    const detail = s.detail ? `<span class="progress-step-detail">${esc(s.detail)}</span>` : '';
+    return `<div class="progress-step progress-step-${s.status}">
+      <span class="progress-step-icon">${icon}</span>
+      <span class="progress-step-label">${esc(s.label)}</span>${detail}
+    </div>`;
+  }).join('');
+}
+
+// ── Health tab ────────────────────────────────────────────────────────────────
+function switchRcTab(tab) {
+  document.getElementById('tab-quote').classList.toggle('active', tab === 'quote');
+  document.getElementById('tab-health').classList.toggle('active', tab === 'health');
+  const showQuote  = tab === 'quote';
+  const quoteVis   = window._lastQuote || fileQueue.some(i => i.status === 'done');
+  document.getElementById('results').style.display       = (showQuote && window._lastQuote && fileQueue.length <= 1) ? 'block' : 'none';
+  document.getElementById('batch-results').style.display = (showQuote && fileQueue.length > 1 && fileQueue.some(i => i.status === 'done')) ? 'block' : 'none';
+  document.getElementById('health-panel').style.display  = tab === 'health' ? 'block' : 'none';
+}
+
+function updateHealthTab() {
+  const files = fileQueue.filter(i => i.sizeCheck);
+  const tab   = document.getElementById('tab-health');
+  const hasWarn = files.some(i => i.sizeCheck.overflow_warning || (i.sizeCheck.mesh_warnings||[]).length > 0);
+  tab.classList.toggle('has-warn', hasWarn);
+
+  if (!files.length) {
+    document.getElementById('health-list').innerHTML = '<div class="health-empty">Run a pre-flight check to see results.</div>';
+    return;
+  }
+  document.getElementById('health-list').innerHTML = files.map(item => {
+    const sc   = item.sizeCheck;
+    const sz   = sc.size ? `${sc.size.x} × ${sc.size.y} × ${sc.size.z} mm` : null;
+    const bv   = sc.build_vol ? `Build volume: ${sc.build_vol.x} × ${sc.build_vol.y} × ${sc.build_vol.z} mm` : null;
+    const warns = sc.mesh_warnings || [];
+    const hasIssues = sc.overflow_warning || warns.length;
+    const statusIcon = hasIssues ? '⚠' : '✓';
+    const statusCls  = hasIssues ? 'has-issues' : '';
+    const overflowHtml = sc.overflow_warning
+      ? `<div class="health-warn">⚠ ${esc(sc.overflow_warning)}</div>` : '';
+    const warnHtml = warns.map(w => `<div class="health-warn">⚠ ${esc(w)}</div>`).join('');
+    const okHtml   = (!hasIssues) ? `<div class="health-ok">✓ No issues detected</div>` : '';
+    return `<div class="health-file ${statusCls}">
+      <div class="health-filename">${statusIcon} ${esc(item.file.name)}</div>
+      ${sz ? `<div class="health-dims">${sz}${bv ? ' &nbsp;·&nbsp; ' + bv : ''}</div>` : ''}
+      ${overflowHtml}${warnHtml}${okHtml}
+    </div>`;
+  }).join('');
+}
+
+function buildFormData(file, settings, sizeOverride, pid) {
   const s  = settings || getFormSettings();
   const fd = new FormData();
   fd.append('file',          file);
@@ -1824,6 +2041,7 @@ function buildFormData(file, settings, sizeOverride) {
   fd.append('quantity',      s.quantity);
   fd.append('farm_size',     s.farm_size);
   fd.append('time_factor',   s.time_factor);
+  if (pid) fd.append('progress_id', pid);
   // sizeOverride from pre-flight check takes precedence over form checkboxes
   const scaleOverride = sizeOverride === 'scale_fit';
   const splitOverride = sizeOverride === 'split';
@@ -1917,13 +2135,17 @@ async function runQuote() {
       fd.append('printer', s.printer);
       const res  = await fetch('/api/check_size', {method:'POST', body:fd});
       const data = await res.json();
+      // Store on queue item for health tab
+      if (fileQueue.length === 1) fileQueue[0].sizeCheck = data;
       const hasIssues = data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0);
+      updateHealthTab();
       if (hasIssues) {
         const tempItem = {file: selectedFile, sizeCheck: data, sizeOverride: 'warn', settings: s};
         window._preflightOversized = [tempItem];
         window._preflightCallback  = async () => { await _doSingleQuote(tempItem.sizeOverride); };
         _renderPreflightList([tempItem]);
         document.getElementById('preflight-panel').style.display = 'block';
+        document.getElementById('rc-tabs').style.display = 'flex';
         btn.disabled    = false;
         btn.textContent = 'Generate Quote';
         return;
@@ -1937,20 +2159,22 @@ async function runQuote() {
 async function _doSingleQuote(sizeOverride) {
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
-  const doOrient = document.getElementById('auto-orient').checked;
-  const doSplit  = document.getElementById('auto-split').checked;
-  let statusMsg  = 'Slicing…';
-  if (doOrient && doSplit) statusMsg = 'Orienting & splitting…';
-  else if (doOrient) statusMsg = 'Orienting…';
-  else if (doSplit)  statusMsg = 'Splitting…';
-  btn.innerHTML = `<span class="spinner"></span> ${statusMsg}`;
   const pp = document.getElementById('print-profile-sel').value;
   const fp = document.getElementById('filament-sel').value;
   if (pp) localStorage.setItem('lastPrintProfile', pp);
   if (fp) localStorage.setItem('lastFilament', fp);
+
+  _clientSteps = [];
+  const pid = makePid();
+  showProgressPanel(selectedFile ? selectedFile.name : 'Quoting…');
+  btn.innerHTML = `<span class="spinner"></span> Quoting…`;
+  startProgressPoll(pid);
+
   try {
-    const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile, null, sizeOverride) });
+    const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile, null, sizeOverride, pid) });
+    stopProgressPoll();
     const data = await res.json();
+    hideProgressPanel();
     if (!res.ok) {
       const errMsg = (data.overflow_warning ? data.overflow_warning + '\\n\\n' : '') + (data.error || 'Slicing failed');
       showError(errMsg);
@@ -1959,6 +2183,8 @@ async function _doSingleQuote(sizeOverride) {
       showResults(data);
     }
   } catch (e) {
+    stopProgressPoll();
+    hideProgressPanel();
     showError(String(e));
   }
   btn.disabled    = false;
@@ -1981,11 +2207,14 @@ async function runBatch() {
   // ── Pre-flight: check sizes for pending files before slicing ──────────────
   const pendingItems = fileQueue.filter(item => item.status !== 'done');
   if (pendingItems.length > 0) {
-    btn.innerHTML = `<span class="spinner"></span> Checking sizes…`;
+    _clientSteps = [];
+    showProgressPanel('Pre-flight Check', `${pendingItems.length} file${pendingItems.length>1?'s':''}`);
+    btn.innerHTML = `<span class="spinner"></span> Checking…`;
     const oversized = [];
     for (const item of pendingItems) {
       const s = item.settings || getFormSettings();
-      if (!s.printer) continue;
+      addProgressStep(item.file.name, 'running', 'checking…');
+      if (!s.printer) { addProgressStep(item.file.name, 'done', 'no printer selected'); continue; }
       const fd = new FormData();
       fd.append('file', item.file);
       fd.append('printer', s.printer);
@@ -1993,18 +2222,28 @@ async function runBatch() {
         const res  = await fetch('/api/check_size', {method:'POST', body:fd});
         const data = await res.json();
         item.sizeCheck = data;
-        if (data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0)) oversized.push(item);
-      } catch(e) { console.warn('Size check failed for', item.file.name, e); }
+        const issues = [data.overflow_warning, ...(data.mesh_warnings||[])].filter(Boolean);
+        const detail = issues.length ? `${issues.length} issue${issues.length>1?'s':''}` : (data.size ? `${data.size.x}×${data.size.y}×${data.size.z} mm` : 'ok');
+        addProgressStep(item.file.name, issues.length ? 'error' : 'done', detail);
+        if (issues.length) oversized.push(item);
+      } catch(e) {
+        addProgressStep(item.file.name, 'error', 'check failed');
+        console.warn('Size check failed for', item.file.name, e);
+      }
     }
+    updateHealthTab();
     if (oversized.length > 0) {
+      hideProgressPanel();
       window._preflightOversized = oversized;
       window._preflightCallback  = async () => { await _runBatchSlice(); };
       _renderPreflightList(oversized);
       document.getElementById('preflight-panel').style.display = 'block';
+      document.getElementById('rc-tabs').style.display = 'flex';
       btn.disabled    = false;
       btn.textContent = 'Quote All';
       return;  // wait for user to click "Continue & Quote"
     }
+    hideProgressPanel();
   }
 
   await _runBatchSlice();
@@ -2063,24 +2302,39 @@ async function _runBatchSlice() {
   btn.disabled = true;
   document.getElementById('batch-results').style.display = 'none';
 
+  const total = fileQueue.filter(i => i.status !== 'done').length;
+  let done = 0;
+
   for (let i = 0; i < fileQueue.length; i++) {
     const item = fileQueue[i];
     if (item.status === 'done') continue;
+    done++;
     item.status = 'slicing'; renderQueue();
-    btn.innerHTML = `<span class="spinner"></span> ${i+1}/${fileQueue.length} Quoting…`;
+
+    _clientSteps = [];
+    const pid = makePid();
+    showProgressPanel(item.file.name, `File ${done} of ${total}`);
+    btn.innerHTML = `<span class="spinner"></span> ${done}/${total} Quoting…`;
+    startProgressPoll(pid);
+
     try {
-      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file, item.settings, item.sizeOverride)});
+      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file, item.settings, item.sizeOverride, pid)});
+      stopProgressPoll();
       const data = await res.json();
       item.status = res.ok ? 'done' : 'error';
       item.result = data;
     } catch(e) {
+      stopProgressPoll();
       item.status = 'error';
       item.result = {error: String(e), filename: item.file.name};
     }
+    hideProgressPanel();
     renderQueue();
   }
+
   btn.disabled = false;
   btn.textContent = 'Quote All';
+  document.getElementById('rc-tabs').style.display = 'flex';
   showBatchResults();
 }
 
@@ -2171,8 +2425,13 @@ function copyModalQuote() {
 }
 
 function showResults(d) {
-  document.getElementById('placeholder').style.display = 'none';
-  document.getElementById('results').style.display = 'block';
+  document.getElementById('placeholder').style.display  = 'none';
+  document.getElementById('health-panel').style.display = 'none';
+  document.getElementById('results').style.display      = 'block';
+  document.getElementById('rc-tabs').style.display      = 'flex';
+  document.getElementById('tab-quote').classList.add('active');
+  document.getElementById('tab-health').classList.remove('active');
+  updateHealthTab();
 
   document.getElementById('res-filename').textContent = d.filename;
   const parts = [d.printer, d.print_profile, d.filament].filter(Boolean);
@@ -2589,4 +2848,4 @@ if __name__ == "__main__":
     print("Press Ctrl+C to stop.\n")
     threading.Thread(target=open_browser, daemon=True).start()
     host = "0.0.0.0" if os.environ.get("DOCKER") else "127.0.0.1"
-    app.run(host=host, port=PORT, debug=False)
+    app.run(host=host, port=PORT, debug=False, threaded=True)
