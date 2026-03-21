@@ -296,7 +296,10 @@ def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
     except ImportError:
         return [(stl_path, "whole")]
 
-    mesh = tm.load(stl_path, force="mesh")
+    try:
+        mesh = tm.load(stl_path, force="mesh")
+    except Exception:
+        return [(stl_path, "whole")]
     bv   = build_vol
 
     def mesh_fits(m):
