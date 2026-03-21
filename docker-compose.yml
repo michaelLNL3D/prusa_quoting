@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   prusaquoting:
     build: .
@@ -7,13 +5,14 @@ services:
     ports:
       - "5111:5111"
     volumes:
-      # Mount your local PrusaSlicer config so your printer/filament/print profiles
-      # are available inside the container.
-      - "${PRUSASLICER_CONFIG:-${HOME}/Library/Application Support/PrusaSlicer}:/data/prusaslicer_config:ro"
+      # Mount your local PrusaSlicer config where PrusaSlicer expects it on Linux.
+      # PrusaSlicer CLI on Linux reads from ~/.config/PrusaSlicer (= /root/.config/PrusaSlicer).
+      - "${PRUSASLICER_CONFIG:-${HOME}/Library/Application Support/PrusaSlicer}:/root/.config/PrusaSlicer"
       # Persistent volume for saved presets and GCode exports
       - prusaquoting_data:/data
     environment:
       - PORT=5111
+      - PRUSA_USER_DIR=/root/.config/PrusaSlicer
 
 volumes:
   prusaquoting_data:

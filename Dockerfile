@@ -32,7 +32,9 @@ RUN wget -q \
 
 
 # ── Stage 2: runtime (linux/amd64 — QEMU on Apple Silicon, native on x86 Linux) ──
-FROM --platform=linux/amd64 ubuntu:22.04
+# Ubuntu 24.04 required: PrusaSlicer newer-distros and OrcaSlicer 2.3.1 both need
+# libwebkit2gtk-4.1 which is not in 22.04.
+FROM --platform=linux/amd64 ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -42,18 +44,19 @@ RUN apt-get update && apt-get install -y \
     libxrender1 libxrandr2 libxss1 libxcursor1 libxcomposite1 \
     libxi6 libxtst6 libfontconfig1 libfreetype6 \
     libatk1.0-0 libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
-    xvfb \
+    libwebkit2gtk-4.1-0 \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 COPY --from=slicer-extract /opt/prusaslicer /opt/prusaslicer
 COPY --from=slicer-extract /opt/orcaslicer  /opt/orcaslicer
 
 # Wrapper scripts: set bundled lib path, then exec the actual binary
-RUN printf '#!/bin/sh\nexport LD_LIBRARY_PATH="/opt/prusaslicer/usr/lib:/opt/prusaslicer/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec /opt/prusaslicer/usr/bin/prusa-slicer "$@"\n' \
+# The AppImage's own prusa-slicer script correctly sets LD_LIBRARY_PATH=$DIR/bin
+RUN printf '#!/bin/sh\nexec /opt/prusaslicer/usr/bin/prusa-slicer "$@"\n' \
       > /usr/local/bin/prusa-slicer && chmod +x /usr/local/bin/prusa-slicer
 
 RUN printf '#!/bin/sh\nexport LC_ALL=C\nexport LD_LIBRARY_PATH="/opt/orcaslicer/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec /opt/orcaslicer/bin/orca-slicer "$@"\n' \
@@ -66,8 +69,8 @@ RUN mkdir -p /data/prusaslicer_config /data/exports
 
 ENV PRUSASLICER_PATH=/usr/local/bin/prusa-slicer
 ENV ORCASLICER_PATH=/usr/local/bin/orca-slicer
-ENV PRUSA_VENDOR_DIR=/opt/prusaslicer/usr/share/PrusaSlicer/profiles
-ENV PRUSA_USER_DIR=/data/prusaslicer_config
+ENV PRUSA_VENDOR_DIR=/opt/prusaslicer/usr/bin/resources/profiles
+ENV PRUSA_USER_DIR=/root/.config/PrusaSlicer
 ENV PRESETS_FILE=/data/presets.json
 ENV PORT=5111
 ENV HOME=/root
