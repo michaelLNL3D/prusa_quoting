@@ -1021,7 +1021,7 @@ HTML = """<!DOCTYPE html>
   }
   #drop-zone:hover, #drop-zone.dragover { border-color: var(--accent); background: rgba(108,99,255,.06); }
   #drop-zone.has-file { border-color: var(--accent2); background: rgba(78,205,196,.05); }
-  #drop-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  #drop-zone input[type=file] { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; pointer-events: none; }
   .drop-icon { font-size: 2rem; margin-bottom: 0.5rem; }
   .drop-label { font-size: 0.9rem; color: var(--muted); }
   .drop-label span { color: var(--accent); font-weight: 600; }
@@ -1169,10 +1169,10 @@ HTML = """<!DOCTYPE html>
           <button class="preset-btn save-btn" onclick="savePreset()">Save Current Settings as Preset…</button>
           <div class="card-title">Model File</div>
         <div id="drop-zone">
-          <input type="file" id="file-input" accept=".stl,.obj,.3mf,.amf" multiple>
+          <input type="file" id="file-input" accept=".stl,.obj,.3mf,.amf,.step,.stp" multiple>
           <div class="drop-icon">📦</div>
           <div class="drop-label"><span>Click to browse</span> or drag & drop</div>
-          <div class="drop-label" style="margin-top:.25rem;font-size:.75rem">STL · OBJ · 3MF · AMF</div>
+          <div class="drop-label" style="margin-top:.25rem;font-size:.75rem">STL · OBJ · 3MF · AMF · STEP</div>
           <div id="file-queue">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem">
               <span style="font-size:.7rem;font-weight:700;color:var(--muted);letter-spacing:.08em;text-transform:uppercase">Queue (<span id="queue-count">0</span>)</span>
@@ -1435,11 +1435,14 @@ function toggleFeature(rowId, checkId) {
 
 const dropZone  = document.getElementById('drop-zone');
 const fileInput = document.getElementById('file-input');
+dropZone.addEventListener('click', e => {
+    if (!e.target.closest('.queue-clear, .queue-item')) fileInput.click();
+  });
 dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop', e => {
     e.preventDefault(); dropZone.classList.remove('dragover');
-    const files = Array.from(e.dataTransfer.files).filter(f => /\\.(stl|obj|3mf|amf)$/i.test(f.name));
+    const files = Array.from(e.dataTransfer.files).filter(f => /\\.(stl|obj|3mf|amf|step|stp)$/i.test(f.name));
     if (files.length) { addFilesToQueue(files); dropZone.classList.add('has-file'); document.getElementById('file-name').textContent = files.length === 1 ? '✓ ' + files[0].name : `✓ ${files.length} files queued`; }
   });
 fileInput.addEventListener('change', () => {
