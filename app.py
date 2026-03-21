@@ -654,6 +654,34 @@ def api_presets_delete(name):
     return jsonify({"ok": True})
 
 
+@app.route("/api/check_size", methods=["POST"])
+def api_check_size():
+    """Quick bounding-box check — no slicing, just --info."""
+    import shutil, tempfile
+    file    = request.files.get("file")
+    printer = request.form.get("printer", "")
+    if not file:
+        return jsonify({"error": "No file"}), 400
+    suffix = Path(file.filename).suffix.lower()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "check" + suffix)
+        file.save(input_path)
+        sx, sy, sz = get_mesh_bounds(input_path)
+    result = {"filename": file.filename, "size": None, "build_vol": None, "overflow_warning": None}
+    if sx is not None:
+        result["size"] = {"x": round(sx, 1), "y": round(sy, 1), "z": round(sz, 1)}
+        if printer:
+            bv = get_build_volume(printer)
+            result["build_vol"] = bv
+            over = []
+            if sx > bv["x"]: over.append(f"X {sx:.0f} > {bv['x']:.0f} mm")
+            if sy > bv["y"]: over.append(f"Y {sy:.0f} > {bv['y']:.0f} mm")
+            if sz > bv["z"]: over.append(f"Z {sz:.0f} > {bv['z']:.0f} mm")
+            if over:
+                result["overflow_warning"] = f"Exceeds build volume ({', '.join(over)})"
+    return jsonify(result)
+
+
 @app.route("/api/quote", methods=["POST"])
 def api_quote():
     file = request.files.get("file")
@@ -676,8 +704,9 @@ def api_quote():
     quantity     = int(form.get("quantity", 1) or 1)
     time_factor  = float(form.get("time_factor", 1.0) or 1.0)
     farm_size    = max(1, int(form.get("farm_size", 1) or 1))
-    do_orient    = form.get("auto_orient") == "true"
-    do_split     = form.get("auto_split")  == "true"
+    do_orient     = form.get("auto_orient")    == "true"
+    do_split      = form.get("auto_split")     == "true"
+    do_scale_fit  = form.get("auto_scale_fit") == "true"
 
     suffix = Path(file.filename).suffix.lower()
 
@@ -716,7 +745,7 @@ def api_quote():
             build_vol = get_build_volume(printer)
 
             # Apply size transform before checking fit
-            if do_split and size_val:
+            if (do_split or do_scale_fit) and size_val:
                 scaled_path = os.path.join(tmpdir, "scaled.stl")
                 scale_args  = parse_size(size_val, size_mode)
                 r = run_slicer(*scale_args, "--export-stl", "--output", scaled_path, work_path)
@@ -732,13 +761,27 @@ def api_quote():
                 if sy > build_vol["y"]: over.append(f"Y {sy:.0f} > {build_vol['y']:.0f} mm")
                 if sz > build_vol["z"]: over.append(f"Z {sz:.0f} > {build_vol['z']:.0f} mm")
                 if over:
-                    if do_split:
+                    if do_scale_fit:
+                        # Use PrusaSlicer's --scale-to-fit so it respects its own internal
+                        # printer limits. Pass 95% of our detected build volume as the target.
+                        fit_x = build_vol["x"] * 0.95
+                        fit_y = build_vol["y"] * 0.95
+                        fit_z = build_vol["z"] * 0.95
+                        overflow_warning = f"Model scaled to fit build volume ({', '.join(over)})."
+                        if do_orient:
+                            work_path, orient_note = auto_orient(work_path, tmpdir)
+                        pieces = [(work_path, "whole")]
+                        # Override size settings so slice_piece uses --scale-to-fit
+                        size_val  = f"{fit_x:.0f},{fit_y:.0f},{fit_z:.0f}"
+                        size_mode = "fit"
+                    elif do_split:
                         # Split at center of overflowing axis; orient each piece if requested
+                        overflow_warning = f"Model too large ({', '.join(over)}), auto-split into pieces."
                         pieces = split_if_needed(work_path, build_vol, tmpdir, do_orient=do_orient)
                         if do_orient:
                             orient_note = "each piece auto-oriented"
                     else:
-                        overflow_warning = f"Model exceeds build volume ({', '.join(over)}). Enable Auto-Split to cut it into printable pieces."
+                        overflow_warning = f"Model exceeds build volume ({', '.join(over)}). Enable Auto-Split or Scale to Fit."
                         # Still auto-orient the single piece if requested
                         if do_orient:
                             work_path, orient_note = auto_orient(work_path, tmpdir)
@@ -776,12 +819,15 @@ def api_quote():
             _last_job["resolved_config"] = None
 
         # ── Slice each piece ──────────────────────────────────────────────────
+        import uuid as _uuid
+        job_id = str(_uuid.uuid4())[:8]
+
         piece_results = []
         errors_out    = []
 
         gcode_paths = []   # (label, path) for all successfully sliced pieces
         for idx, (piece_path, piece_label) in enumerate(pieces):
-            persistent_gcode = os.path.join(EXPORT_DIR, f"piece_{idx}.gcode")
+            persistent_gcode = os.path.join(EXPORT_DIR, f"{job_id}_piece_{idx}.gcode")
             try:
                 stats = slice_piece(
                     piece_path, tmpdir, idx,
@@ -798,7 +844,10 @@ def api_quote():
         _last_job["gcode_paths"] = gcode_paths
 
         if not piece_results:
-            return jsonify({"error": "\n".join(errors_out) or "Slicing failed for all pieces"}), 500
+            return jsonify({
+                "error": "\n".join(errors_out) or "Slicing failed for all pieces",
+                "overflow_warning": overflow_warning,
+            }), 500
 
     # ── Aggregate stats ───────────────────────────────────────────────────────
     total_mins   = 0.0
@@ -854,8 +903,6 @@ def api_quote():
         batches   = _math.ceil(quantity / farm_size)
         farm_time = mins_to_str(total_mins * batches)
 
-    import uuid as _uuid
-    job_id = str(_uuid.uuid4())[:8]
     _jobs[job_id] = {"gcode_paths": gcode_paths, "filename": file.filename}
     if len(_jobs) > 50:
         del _jobs[next(iter(_jobs))]
@@ -993,6 +1040,7 @@ HTML = """<!DOCTYPE html>
     --success:  #51cf66;
     --input-bg: #12141e;
     --warn:     #ffa94d;
+    --card-bg:  #1e2130;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1158,8 +1206,30 @@ HTML = """<!DOCTYPE html>
   .batch-table th { text-align:left; padding:0.35rem 0.5rem; font-size:0.68rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--border); }
   .batch-table td { padding:0.4rem 0.5rem; border-bottom:1px solid rgba(42,45,62,.5); }
   .batch-table tr:last-child td { border-bottom:none; }
+  .batch-table tbody tr.clickable { cursor:pointer; }
+  .batch-table tbody tr.clickable:hover td { background:rgba(108,99,255,.07); }
   .batch-totals td { border-top:1px solid var(--border); font-weight:700; color:var(--accent2); padding-top:0.55rem; }
   .batch-err { color:#ff6b6b; font-size:0.75rem; }
+  /* Pre-flight size check panel */
+  #preflight-panel { display:none; margin-top:1rem; }
+  .preflight-title { font-size:0.7rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--warn); margin-bottom:0.6rem; }
+  .preflight-file { display:grid; grid-template-columns:1fr auto; align-items:center; gap:0.5rem; background:rgba(255,169,77,.05); border:1px solid rgba(255,169,77,.25); border-radius:8px; padding:0.65rem 0.85rem; margin-bottom:0.4rem; }
+  .preflight-info { font-size:0.8rem; color:var(--text); }
+  .preflight-info strong { color:var(--warn); }
+  .preflight-info small { display:block; color:var(--muted); font-size:0.72rem; margin-top:0.15rem; }
+  .preflight-actions { display:flex; gap:0.35rem; flex-shrink:0; }
+  .pf-btn { font-size:0.72rem; font-weight:700; padding:0.3rem 0.6rem; border-radius:5px; border:1px solid; cursor:pointer; background:transparent; transition:all .15s; white-space:nowrap; }
+  .pf-btn.active { background:rgba(78,205,196,.15); border-color:var(--accent2); color:var(--accent2); }
+  .pf-btn:not(.active) { border-color:var(--border); color:var(--muted); }
+  .pf-btn:hover:not(.active) { border-color:var(--accent); color:var(--accent); }
+  .preflight-confirm { width:100%; margin-top:0.75rem; padding:0.65rem; background:var(--accent); color:#fff; border:none; border-radius:8px; font-size:0.9rem; font-weight:700; cursor:pointer; }
+  .preflight-confirm:hover { opacity:.88; }
+  /* Quote modal */
+  #quote-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:1000; align-items:center; justify-content:center; padding:1rem; }
+  #quote-modal.open { display:flex; }
+  #quote-modal-inner { background:var(--card-bg); border:1px solid var(--border); border-radius:16px; padding:1.5rem; max-width:480px; width:100%; max-height:90vh; overflow-y:auto; position:relative; }
+  #quote-modal-close { position:absolute; top:0.75rem; right:0.9rem; background:none; border:none; color:var(--muted); font-size:1.3rem; cursor:pointer; line-height:1; }
+  #quote-modal-close:hover { color:#fff; }
   /* Placeholder */
   .placeholder { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4rem 2rem; color: var(--muted); text-align: center; gap: 0.75rem; }
   .placeholder-icon { font-size: 3rem; opacity: .3; }
@@ -1208,12 +1278,19 @@ HTML = """<!DOCTYPE html>
           <span class="feature-badge badge-orca">OrcaSlicer</span>
         </label>
         <label class="feature-row" id="split-row">
-          <input type="checkbox" id="auto-split" onchange="toggleFeature('split-row','auto-split')">
+          <input type="checkbox" id="auto-split" onchange="toggleFeature('split-row','auto-split');if(this.checked)document.getElementById('auto-scale-fit').checked=false;">
           <div>
             <div class="feature-label">Auto-split if too large</div>
             <div class="feature-sub">Cut oversized models to fit build volume</div>
           </div>
           <span class="feature-badge badge-tri">trimesh</span>
+        </label>
+        <label class="feature-row" id="scale-fit-row">
+          <input type="checkbox" id="auto-scale-fit" onchange="toggleFeature('scale-fit-row','auto-scale-fit');if(this.checked)document.getElementById('auto-split').checked=false;">
+          <div>
+            <div class="feature-label">Scale to fit build volume</div>
+            <div class="feature-sub">Shrink oversized models to fit, keeping proportions</div>
+          </div>
         </label>
 
         <hr class="divider">
@@ -1318,10 +1395,17 @@ HTML = """<!DOCTYPE html>
         <div class="placeholder-icon">📐</div>
         <div class="placeholder-text">Upload a model and hit <strong>Generate Quote</strong></div>
       </div>
+      <div id="preflight-panel">
+        <div class="preflight-title">⚠ Oversize Files Detected</div>
+        <div id="preflight-list"></div>
+        <button class="preflight-confirm" onclick="confirmPreflight()">Continue &amp; Quote</button>
+      </div>
+
       <div id="batch-results" style="display:none;margin-top:1rem">
         <div class="card-title" style="margin-bottom:0.5rem">Batch Summary</div>
+        <div id="batch-warnings"></div>
         <table class="batch-table">
-          <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th><th></th></tr></thead>
+          <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th><th>GCode</th></tr></thead>
           <tbody id="batch-tbody"></tbody>
         </table>
       </div>
@@ -1390,14 +1474,20 @@ let supportMode = 'none';
 let selectedFile = null;
 
 async function init() {
-  const [printersRes] = await Promise.all([fetch('/api/printers'), loadPresetsList()]);
-  const printers = await printersRes.json();
-  const sel = document.getElementById('printer-sel');
-  sel.innerHTML = '<option value="">— select printer —</option>' +
-    printers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
-  const last = localStorage.getItem('lastPrinter');
-  if (last && printers.includes(last)) { sel.value = last; await loadProfiles(); }
-  restoreInputs();
+  try {
+    const [printersRes] = await Promise.all([fetch('/api/printers'), loadPresetsList()]);
+    if (!printersRes.ok) throw new Error('Server returned ' + printersRes.status);
+    const printers = await printersRes.json();
+    const sel = document.getElementById('printer-sel');
+    sel.innerHTML = '<option value="">— select printer —</option>' +
+      printers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    const last = localStorage.getItem('lastPrinter');
+    if (last && printers.includes(last)) { sel.value = last; await loadProfiles(); }
+    restoreInputs();
+  } catch(e) {
+    document.getElementById('printer-sel').innerHTML = '<option value="">— server unreachable —</option>';
+    console.error('init() failed:', e);
+  }
 }
 
 async function loadProfiles() {
@@ -1490,8 +1580,9 @@ function getFormSettings() {
     layer_height:  document.getElementById('layer-height').value,
     walls:         document.getElementById('walls').value,
     supports:      supportMode,
-    auto_orient:   document.getElementById('auto-orient').checked,
-    auto_split:    document.getElementById('auto-split').checked,
+    auto_orient:     document.getElementById('auto-orient').checked,
+    auto_split:      document.getElementById('auto-split').checked,
+    auto_scale_fit:  document.getElementById('auto-scale-fit').checked,
     time_factor:   document.getElementById('time-factor').value || '1.0',
     cost_per_kg:   document.getElementById('cost-per-kg').value,
     hourly_rate:   document.getElementById('hourly-rate').value,
@@ -1515,10 +1606,12 @@ async function applyFormSettings(s) {
   document.getElementById('layer-height').value  = s.layer_height;
   document.getElementById('walls').value         = s.walls;
   setSupportMode(s.supports);
-  document.getElementById('auto-orient').checked = s.auto_orient;
-  document.getElementById('auto-split').checked  = s.auto_split;
-  toggleFeature('orient-row', 'auto-orient');
-  toggleFeature('split-row',  'auto-split');
+  document.getElementById('auto-orient').checked    = s.auto_orient;
+  document.getElementById('auto-split').checked     = s.auto_split;
+  document.getElementById('auto-scale-fit').checked = s.auto_scale_fit || false;
+  toggleFeature('orient-row',    'auto-orient');
+  toggleFeature('split-row',     'auto-split');
+  toggleFeature('scale-fit-row', 'auto-scale-fit');
   document.getElementById('time-factor').value  = s.time_factor;
   document.getElementById('cost-per-kg').value  = s.cost_per_kg;
   document.getElementById('hourly-rate').value  = s.hourly_rate;
@@ -1548,11 +1641,21 @@ function deleteQueueItem(i) {
   const btn = document.getElementById('run-btn');
   btn.disabled    = false;
   btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
-  // If one done item remains, show its result right away
-  if (fileQueue.length === 1 && fileQueue[0].status === 'done') showResults(fileQueue[0].result);
+  if (fileQueue.length > 1) {
+    // Refresh the batch summary table to remove the deleted row
+    showBatchResults();
+  } else if (fileQueue[0].status === 'done') {
+    // One done item — show its individual result
+    showResults(fileQueue[0].result);
+  } else {
+    // One pending/error item — show placeholder
+    document.getElementById('batch-results').style.display = 'none';
+    document.getElementById('results').style.display = 'none';
+    document.getElementById('placeholder').style.display = 'block';
+  }
 }
 
-function buildFormData(file, settings) {
+function buildFormData(file, settings, sizeOverride) {
   const s  = settings || getFormSettings();
   const fd = new FormData();
   fd.append('file',          file);
@@ -1570,9 +1673,13 @@ function buildFormData(file, settings) {
   fd.append('markup',        s.markup);
   fd.append('quantity',      s.quantity);
   fd.append('farm_size',     s.farm_size);
-  fd.append('auto_orient',   s.auto_orient ? 'true' : 'false');
-  fd.append('auto_split',    s.auto_split  ? 'true' : 'false');
   fd.append('time_factor',   s.time_factor);
+  // sizeOverride from pre-flight check takes precedence over form checkboxes
+  const scaleOverride = sizeOverride === 'scale_fit';
+  const splitOverride = sizeOverride === 'split';
+  fd.append('auto_orient',    s.auto_orient                               ? 'true' : 'false');
+  fd.append('auto_split',     (splitOverride || (!scaleOverride && s.auto_split))  ? 'true' : 'false');
+  fd.append('auto_scale_fit', (scaleOverride || (!splitOverride && s.auto_scale_fit)) ? 'true' : 'false');
   return fd;
 }
 
@@ -1606,12 +1713,14 @@ function renderQueue() {
 
 function clearQueue() {
   fileQueue = []; selectedFile = null; selectedQueueIdx = -1;
+  window._preflightOversized = [];
   renderQueue();
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
   btn.textContent = 'Generate Quote';
   document.getElementById('file-name').textContent = '';
   document.getElementById('drop-zone').classList.remove('has-file');
+  document.getElementById('preflight-panel').style.display = 'none';
 }
 
 function minsFromStr(s) {
@@ -1660,8 +1769,12 @@ async function runQuote() {
   try {
     const res  = await fetch('/api/quote', { method: 'POST', body: buildFormData(selectedFile) });
     const data = await res.json();
-    if (!res.ok) showError(data.error || 'Slicing failed');
-    else         showResults(data);
+    if (!res.ok) {
+      const errMsg = (data.overflow_warning ? data.overflow_warning + '\\n\\n' : '') + (data.error || 'Slicing failed');
+      showError(errMsg);
+    } else {
+      showResults(data);
+    }
   } catch (e) {
     showError(String(e));
   }
@@ -1672,22 +1785,93 @@ async function runQuote() {
 async function runBatch() {
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
-  document.getElementById('error-box').style.display = 'none';
-  document.getElementById('results').style.display   = 'none';
-  document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('error-box').style.display    = 'none';
+  document.getElementById('results').style.display      = 'none';
+  document.getElementById('placeholder').style.display  = 'none';
   document.getElementById('batch-results').style.display = 'none';
+  document.getElementById('preflight-panel').style.display = 'none';
   saveInputs();
-  // Save current form into whichever item is selected so its settings are captured
   if (selectedQueueIdx >= 0 && selectedQueueIdx < fileQueue.length) {
     fileQueue[selectedQueueIdx].settings = getFormSettings();
   }
+
+  // ── Pre-flight: check sizes for pending files before slicing ──────────────
+  const pendingItems = fileQueue.filter(item => item.status !== 'done');
+  if (pendingItems.length > 0) {
+    btn.innerHTML = `<span class="spinner"></span> Checking sizes…`;
+    const oversized = [];
+    for (const item of pendingItems) {
+      const s = item.settings || getFormSettings();
+      if (!s.printer) continue;
+      const fd = new FormData();
+      fd.append('file', item.file);
+      fd.append('printer', s.printer);
+      try {
+        const res  = await fetch('/api/check_size', {method:'POST', body:fd});
+        const data = await res.json();
+        item.sizeCheck = data;
+        if (data.overflow_warning) oversized.push(item);
+      } catch(e) { console.warn('Size check failed for', item.file.name, e); }
+    }
+    if (oversized.length > 0) {
+      // Show pre-flight panel and stop — user must confirm
+      const listEl = document.getElementById('preflight-list');
+      listEl.innerHTML = oversized.map((item, idx) => {
+        const sc = item.sizeCheck;
+        const sz = sc.size ? `${sc.size.x}×${sc.size.y}×${sc.size.z} mm` : '';
+        const bv = sc.build_vol ? `build volume: ${sc.build_vol.x}×${sc.build_vol.y}×${sc.build_vol.z} mm` : '';
+        const ov = item.sizeOverride || 'warn';
+        return `<div class="preflight-file" id="pf-${idx}">
+          <div class="preflight-info">
+            <strong>${esc(item.file.name)}</strong> — ${esc(sc.overflow_warning||'')}
+            <small>${sz}${bv ? ' · ' + bv : ''}</small>
+          </div>
+          <div class="preflight-actions">
+            <button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
+            <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
+            <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>
+          </div>
+        </div>`;
+      }).join('');
+      // Store reference to oversized items for confirmPreflight
+      window._preflightOversized = oversized;
+      document.getElementById('preflight-panel').style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Quote All';
+      return;  // wait for user to click "Continue & Quote"
+    }
+  }
+
+  await _runBatchSlice();
+}
+
+function setPfOverride(idx, val) {
+  const item = window._preflightOversized[idx];
+  item.sizeOverride = val;
+  // Update button active states
+  const row = document.getElementById(`pf-${idx}`);
+  row.querySelectorAll('.pf-btn').forEach(b => b.classList.remove('active'));
+  const labels = ['scale_fit','split','warn'];
+  row.querySelectorAll('.pf-btn').forEach((b,i) => b.classList.toggle('active', labels[i]===val));
+}
+
+async function confirmPreflight() {
+  document.getElementById('preflight-panel').style.display = 'none';
+  await _runBatchSlice();
+}
+
+async function _runBatchSlice() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  document.getElementById('batch-results').style.display = 'none';
+
   for (let i = 0; i < fileQueue.length; i++) {
     const item = fileQueue[i];
-    if (item.status === 'done') continue;   // already quoted, skip
+    if (item.status === 'done') continue;
     item.status = 'slicing'; renderQueue();
     btn.innerHTML = `<span class="spinner"></span> ${i+1}/${fileQueue.length} Quoting…`;
     try {
-      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file, item.settings)});
+      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file, item.settings, item.sizeOverride)});
       const data = await res.json();
       item.status = res.ok ? 'done' : 'error';
       item.result = data;
@@ -1704,22 +1888,88 @@ async function runBatch() {
 
 function showBatchResults() {
   let totalMins = 0, totalG = 0, totalCost = 0, hasCost = false;
-  const rows = fileQueue.map(item => {
+  const rows = fileQueue.map((item, i) => {
     const d = item.result;
     const fname = d?.filename || item.file.name;
-    const fnCell = `<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(fname)}">${esc(fname)}</td>`;
-    if (!d || d.error) return `<tr>${fnCell}<td colspan="3" class="batch-err">${esc(d?.error||'error')}</td><td>—</td></tr>`;
+    const warnBadge = d?.overflow_warning ? ` <span style="color:#f59e0b;font-size:0.85rem" title="${esc(d.overflow_warning)}">⚠</span>` : '';
+    const fnCell = `<td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(fname)}">${esc(fname)}${warnBadge}</td>`;
+    if (!d || d.error) {
+      return `<tr class="clickable" onclick="openQuoteModal(${i})">${fnCell}<td colspan="3" class="batch-err">${esc(d?.error||'error')}</td><td onclick="event.stopPropagation()">${d?.job_id?`<a href="/api/export_gcode?job_id=${d.job_id}" style="color:var(--accent2);text-decoration:none">↓</a>`:'—'}</td></tr>`;
+    }
     const mins = minsFromStr(d.time);
     totalMins += mins;
     totalG    += d.weight_g || 0;
     const cost = d.quote_price ?? d.subtotal ?? null;
     if (cost != null) { totalCost += cost; hasCost = true; }
-    const dlLink = d.job_id ? `<a href="/api/export_gcode?job_id=${d.job_id}" title="Download GCode" style="color:var(--accent2);text-decoration:none;font-size:1rem">↓</a>` : '—';
-    return `<tr>${fnCell}<td>${esc(d.time||'—')}</td><td>${d.weight_g!=null?d.weight_g+' g':'—'}</td><td>${cost!=null?'$'+cost.toFixed(2):'—'}</td><td>${dlLink}</td></tr>`;
+    const dlLink = d.job_id ? `<a href="/api/export_gcode?job_id=${d.job_id}" title="Download GCode" style="color:var(--accent2);text-decoration:none;font-size:1rem" onclick="event.stopPropagation()">↓</a>` : '—';
+    return `<tr class="clickable" onclick="openQuoteModal(${i})">${fnCell}<td>${esc(d.time||'—')}</td><td>${d.weight_g!=null?d.weight_g+' g':'—'}</td><td>${cost!=null?'$'+cost.toFixed(2):'—'}</td><td onclick="event.stopPropagation()">${dlLink}</td></tr>`;
   });
   rows.push(`<tr class="batch-totals"><td>TOTAL (${fileQueue.length})</td><td>${minsToStr(totalMins)}</td><td>${totalG.toFixed(1)} g</td><td>${hasCost?'$'+totalCost.toFixed(2):'—'}</td><td></td></tr>`);
   document.getElementById('batch-tbody').innerHTML = rows.join('');
+  // Collect and display overflow warnings prominently
+  const warnings = fileQueue
+    .filter(item => item.result?.overflow_warning)
+    .map(item => `<div class="warn-row" style="margin-bottom:0.4rem">⚠ <strong>${esc(item.file.name)}:</strong> ${esc(item.result.overflow_warning)}</div>`);
+  document.getElementById('batch-warnings').innerHTML = warnings.join('');
   document.getElementById('batch-results').style.display = 'block';
+}
+
+let _modalQuote = null;
+function openQuoteModal(i) {
+  const item = fileQueue[i];
+  if (!item?.result) return;
+  const d = item.result;
+  _modalQuote = d;
+  document.getElementById('modal-filename').textContent = d.filename || item.file.name;
+  const parts = [d.printer, d.print_profile, d.filament].filter(Boolean);
+  const extras = [];
+  if (d.walls)                             extras.push(`${d.walls} walls`);
+  if (d.supports && d.supports !== 'none') extras.push(`${d.supports} supports`);
+  document.getElementById('modal-profiles').textContent = [...parts, ...extras].join(' · ') || 'Default settings';
+
+  const warnEl = document.getElementById('modal-warn');
+  if (d.overflow_warning) { warnEl.style.display='block'; warnEl.textContent='⚠ '+d.overflow_warning; }
+  else                    { warnEl.style.display='none'; }
+
+  const applied = document.getElementById('modal-applied');
+  applied.innerHTML = '';
+  if (d.orient_note)   applied.innerHTML += `<span class="applied-tag tag-orient">↻ auto-oriented</span>`;
+  if (d.split_count>1) applied.innerHTML += `<span class="applied-tag tag-split">✂ split into ${d.split_count} pieces</span>`;
+
+  document.getElementById('modal-time').textContent   = d.time    || '—';
+  document.getElementById('modal-weight').textContent = d.weight_g!=null ? d.weight_g+' g' : '—';
+  document.getElementById('modal-volume').textContent = d.volume_cm3!=null ? d.volume_cm3+' cm³' : '—';
+  document.getElementById('modal-pieces').textContent = d.split_count || 1;
+
+  // Cost table
+  const rows = [];
+  if (d.material_cost!=null) rows.push(`<tr><td>Material</td><td>$${d.material_cost.toFixed(2)}</td></tr>`);
+  if (d.machine_cost!=null)  rows.push(`<tr><td>Machine time</td><td>$${d.machine_cost.toFixed(2)}</td></tr>`);
+  if (d.subtotal!=null)      rows.push(`<tr><td>Subtotal</td><td>$${d.subtotal.toFixed(2)}</td></tr>`);
+  if (d.markup_amt!=null)    rows.push(`<tr><td>Markup (${d.markup_pct}%)</td><td>$${d.markup_amt.toFixed(2)}</td></tr>`);
+  if (d.quote_price!=null)   rows.push(`<tr class="total-row"><td>Quote Price</td><td>$${d.quote_price.toFixed(2)}</td></tr>`);
+  document.getElementById('modal-cost-tbody').innerHTML = rows.join('');
+
+  const dlBtn = document.getElementById('modal-dl-gcode');
+  dlBtn.href = d.job_id ? `/api/export_gcode?job_id=${d.job_id}` : '/api/export_gcode';
+
+  document.getElementById('quote-modal').classList.add('open');
+}
+function closeQuoteModal() {
+  document.getElementById('quote-modal').classList.remove('open');
+}
+function copyModalQuote() {
+  if (!_modalQuote) return;
+  const d = _modalQuote;
+  const lines = [
+    `File: ${d.filename}`,
+    `Printer: ${[d.printer,d.print_profile,d.filament].filter(Boolean).join(' / ')}`,
+    `Time: ${d.time||'—'}`,
+    `Weight: ${d.weight_g!=null?d.weight_g+' g':'—'}`,
+  ];
+  if (d.quote_price!=null) lines.push(`Quote: $${d.quote_price.toFixed(2)}`);
+  else if (d.subtotal!=null) lines.push(`Subtotal: $${d.subtotal.toFixed(2)}`);
+  navigator.clipboard.writeText(lines.join('\\n')).catch(()=>{});
 }
 
 function showResults(d) {
@@ -1966,17 +2216,27 @@ async function savePreset() {
     markup:        document.getElementById('markup').value,
     farm_size:     document.getElementById('farm-size').value,
   };
-  await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-  await loadPresetsList();
-  document.getElementById('preset-sel').value = body.name;
+  try {
+    const res = await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if (!res.ok) throw new Error('Server returned ' + res.status);
+    await loadPresetsList();
+    document.getElementById('preset-sel').value = body.name;
+  } catch(e) {
+    alert('Failed to save preset: ' + e.message);
+  }
 }
 
 async function deletePreset() {
   const name = document.getElementById('preset-sel').value;
   if (!name) return;
   if (!confirm(`Delete preset "${name}"?`)) return;
-  await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
-  await loadPresetsList();
+  try {
+    const res = await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
+    if (!res.ok) throw new Error('Server returned ' + res.status);
+    await loadPresetsList();
+  } catch(e) {
+    alert('Failed to delete preset: ' + e.message);
+  }
 }
 
 const PERSIST_IDS = ['cost-per-kg', 'hourly-rate', 'markup', 'quantity', 'infill', 'layer-height', 'walls', 'time-factor', 'farm-size'];
@@ -2005,20 +2265,45 @@ document.getElementById('auto-orient').addEventListener('change', function() {
 document.getElementById('auto-split').addEventListener('change', function() {
   localStorage.setItem('chk_auto-split', this.checked);
 });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeQuoteModal(); });
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function parseTimeToMins(t) {
   if (!t) return 0;
   let total = 0;
-  for (const m of String(t).matchAll(/(\\d+)\\s*([hms])/g)) {
+  for (const m of String(t).matchAll(/(\\d+)\\s*([dhms])/g)) {
     const v = parseInt(m[1]);
-    if (m[2]==='h') total+=v*60; else if (m[2]==='m') total+=v; else if (m[2]==='s') total+=v/60;
+    if (m[2]==='d') total+=v*1440; else if (m[2]==='h') total+=v*60; else if (m[2]==='m') total+=v; else if (m[2]==='s') total+=v/60;
   }
   return total;
 }
 
 init();
 </script>
+
+<!-- Individual quote modal -->
+<div id="quote-modal" onclick="if(event.target===this)closeQuoteModal()">
+  <div id="quote-modal-inner">
+    <button id="quote-modal-close" onclick="closeQuoteModal()">×</button>
+    <div id="modal-filename" class="result-filename" style="margin-bottom:0.25rem">—</div>
+    <div id="modal-profiles" class="result-sub" style="margin-bottom:0.75rem">—</div>
+    <div id="modal-warn" class="warn-row" style="display:none;margin-bottom:0.75rem"></div>
+    <div id="modal-applied" class="applied-row" style="margin-bottom:0.75rem"></div>
+    <div class="stat-grid" style="margin-bottom:0.75rem">
+      <div class="stat-box"><div class="stat-label">Print Time</div><div class="stat-value" id="modal-time">—</div></div>
+      <div class="stat-box"><div class="stat-label">Weight</div><div class="stat-value accent" id="modal-weight">—</div></div>
+      <div class="stat-box"><div class="stat-label">Volume</div><div class="stat-value" id="modal-volume">—</div></div>
+      <div class="stat-box"><div class="stat-label">Pieces</div><div class="stat-value" id="modal-pieces">1</div></div>
+    </div>
+    <hr class="divider" style="margin:0.75rem 0">
+    <div class="card-title" style="margin-bottom:0.5rem">Cost Breakdown</div>
+    <table class="cost-table"><tbody id="modal-cost-tbody"></tbody></table>
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap">
+      <a id="modal-dl-gcode" class="copy-btn" href="#" style="text-decoration:none;padding:0.35rem 0.7rem">Download GCode</a>
+      <button class="copy-btn" onclick="copyModalQuote()">Copy Quote</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 """
