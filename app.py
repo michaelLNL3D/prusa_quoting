@@ -6,6 +6,7 @@ Then open: http://localhost:5111
 """
 
 import configparser
+import datetime
 import glob
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import webbrowser
 from pathlib import Path
 
@@ -33,7 +35,29 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 _last_job = {}   # {input_path, printer, print_prof, filament, infill, layer_h, walls, supports, size_val, size_mode, filename}
 _jobs     = {}   # job_id -> {gcode_paths, filename}  (last 50 jobs)
 
+# In-memory error log (last 100 entries)
+_error_log = []
+
+def _log_error(endpoint, error, tb=None, params=None):
+    _error_log.append({
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "endpoint":  endpoint,
+        "error":     str(error),
+        "type":      type(error).__name__,
+        "traceback": tb or traceback.format_exc(),
+        "params":    params,
+    })
+    if len(_error_log) > 100:
+        _error_log.pop(0)
+
 app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    """Catch all unhandled exceptions, log them, and return JSON instead of HTML."""
+    tb = traceback.format_exc()
+    _log_error(request.path, e, tb, {"method": request.method})
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 
 # ── Slicer helpers ────────────────────────────────────────────────────────────
@@ -671,9 +695,19 @@ def api_presets_delete(name):
     return jsonify({"ok": True})
 
 
+@app.route("/api/debug_log", methods=["GET"])
+def api_debug_log_get():
+    return jsonify(list(reversed(_error_log)))
+
+@app.route("/api/debug_log", methods=["DELETE"])
+def api_debug_log_clear():
+    _error_log.clear()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/check_size", methods=["POST"])
 def api_check_size():
-    """Quick bounding-box check — no slicing, just --info."""
+    """Quick bounding-box + mesh health check — no slicing."""
     import shutil, tempfile
     file    = request.files.get("file")
     printer = request.form.get("printer", "")
@@ -684,7 +718,27 @@ def api_check_size():
         input_path = os.path.join(tmpdir, "check" + suffix)
         file.save(input_path)
         sx, sy, sz = get_mesh_bounds(input_path)
-    result = {"filename": file.filename, "size": None, "build_vol": None, "overflow_warning": None}
+
+        # Mesh health checks via trimesh (best-effort)
+        mesh_warnings = []
+        try:
+            import trimesh as tm
+            mesh = tm.load(input_path, force="mesh")
+            if mesh.is_empty or len(mesh.faces) == 0:
+                mesh_warnings.append("Empty mesh — file may be corrupted or contain no geometry.")
+            else:
+                if not mesh.is_watertight:
+                    mesh_warnings.append("Mesh is not watertight (open holes detected) — may cause slicing errors or missing surfaces.")
+                if mesh.bounds is not None and mesh.bounds[0][2] < -0.01:
+                    mesh_warnings.append(f"Geometry below Z=0 ({mesh.bounds[0][2]:.1f} mm) — part of the model will be cut off by the build plate.")
+                face_count = len(mesh.faces)
+                if face_count > 2_000_000:
+                    mesh_warnings.append(f"Very high polygon count ({face_count:,} faces) — slicing may be slow.")
+        except Exception:
+            pass  # trimesh unavailable or can't parse — skip health checks
+
+    result = {"filename": file.filename, "size": None, "build_vol": None,
+              "overflow_warning": None, "mesh_warnings": mesh_warnings}
     if sx is None:
         result["overflow_warning"] = "Could not read model dimensions — size check skipped. Verify the file fits before slicing."
         result["parse_failed"] = True
@@ -1244,6 +1298,31 @@ HTML = """<!DOCTYPE html>
   .pf-btn:hover:not(.active) { border-color:var(--accent); color:var(--accent); }
   .preflight-confirm { width:100%; margin-top:0.75rem; padding:0.65rem; background:var(--accent); color:#fff; border:none; border-radius:8px; font-size:0.9rem; font-weight:700; cursor:pointer; }
   .preflight-confirm:hover { opacity:.88; }
+  .pf-mesh-warns { margin-top:0.4rem; display:flex; flex-direction:column; gap:0.2rem; }
+  .pf-mesh-warn { font-size:0.72rem; color:var(--warn); opacity:.9; }
+  /* Debug panel */
+  #debug-btn { position:fixed; bottom:1.2rem; right:1.2rem; z-index:900; background:var(--surface); border:1px solid var(--border); color:var(--muted); font-size:0.72rem; font-weight:700; padding:0.4rem 0.75rem; border-radius:20px; cursor:pointer; letter-spacing:.05em; transition:all .15s; }
+  #debug-btn:hover { border-color:var(--accent); color:var(--accent); }
+  #debug-btn.has-errors { border-color:var(--danger); color:var(--danger); }
+  #debug-panel { display:none; position:fixed; bottom:0; left:0; right:0; z-index:950; background:#0a0c12; border-top:2px solid var(--border); max-height:55vh; overflow-y:auto; font-family:ui-monospace,monospace; font-size:0.75rem; }
+  #debug-panel.open { display:block; }
+  .debug-header { display:flex; align-items:center; gap:0.75rem; padding:0.6rem 1rem; background:#0f1117; border-bottom:1px solid var(--border); position:sticky; top:0; }
+  .debug-header-title { font-weight:700; color:var(--text); flex:1; letter-spacing:.05em; font-size:0.72rem; text-transform:uppercase; }
+  .debug-clear-btn { font-size:0.7rem; padding:0.25rem 0.6rem; border:1px solid var(--border); border-radius:4px; background:transparent; color:var(--muted); cursor:pointer; }
+  .debug-clear-btn:hover { border-color:var(--danger); color:var(--danger); }
+  .debug-close-btn { background:none; border:none; color:var(--muted); font-size:1.1rem; cursor:pointer; line-height:1; padding:0 0.25rem; }
+  .debug-close-btn:hover { color:#fff; }
+  .debug-empty { padding:1.5rem; color:var(--muted); text-align:center; }
+  .debug-entry { border-bottom:1px solid #1a1d27; }
+  .debug-entry-head { display:grid; grid-template-columns:auto auto 1fr auto; gap:0.6rem; align-items:center; padding:0.55rem 1rem; cursor:pointer; }
+  .debug-entry-head:hover { background:rgba(255,255,255,.03); }
+  .debug-ts { color:var(--muted); white-space:nowrap; }
+  .debug-ep { color:var(--accent2); white-space:nowrap; }
+  .debug-msg { color:var(--danger); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .debug-toggle { color:var(--muted); font-size:0.65rem; }
+  .debug-entry-body { display:none; padding:0.5rem 1rem 0.75rem; background:#070910; }
+  .debug-entry-body.open { display:block; }
+  .debug-tb { white-space:pre-wrap; color:#a0a8c0; font-size:0.7rem; line-height:1.5; margin:0; }
   /* Quote modal */
   #quote-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:1000; align-items:center; justify-content:center; padding:1rem; }
   #quote-modal.open { display:flex; }
@@ -1830,7 +1909,7 @@ async function runBatch() {
         const res  = await fetch('/api/check_size', {method:'POST', body:fd});
         const data = await res.json();
         item.sizeCheck = data;
-        if (data.overflow_warning) oversized.push(item);
+        if (data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0)) oversized.push(item);
       } catch(e) { console.warn('Size check failed for', item.file.name, e); }
     }
     if (oversized.length > 0) {
@@ -1842,15 +1921,23 @@ async function runBatch() {
         const bv = sc.build_vol ? `build volume: ${sc.build_vol.x}×${sc.build_vol.y}×${sc.build_vol.z} mm` : '';
         const ov = item.sizeOverride || 'warn';
         const parseFailed = sc.parse_failed === true;
-        const actions = parseFailed
+        const hasOverflow = !!sc.overflow_warning;
+        const meshWarns = sc.mesh_warnings || [];
+        const meshWarnHtml = meshWarns.length
+          ? `<div class="pf-mesh-warns">${meshWarns.map(w => `<div class="pf-mesh-warn">⚠ ${esc(w)}</div>`).join('')}</div>`
+          : '';
+        const sizeActions = parseFailed
           ? `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`
           : `<button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
             <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
             <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
+        const actions = hasOverflow || parseFailed ? sizeActions
+          : `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
         return `<div class="preflight-file" id="pf-${idx}">
           <div class="preflight-info">
-            <strong>${esc(item.file.name)}</strong> — ${esc(sc.overflow_warning||'')}
+            <strong>${esc(item.file.name)}</strong>${sc.overflow_warning ? ' — ' + esc(sc.overflow_warning) : ''}
             <small>${sz}${bv ? ' · ' + bv : ''}</small>
+            ${meshWarnHtml}
           </div>
           <div class="preflight-actions">${actions}</div>
         </div>`;
@@ -2326,6 +2413,77 @@ init();
     </div>
   </div>
 </div>
+<!-- Debug panel -->
+<button id="debug-btn" onclick="toggleDebug()" title="Error log">🐛 Debug</button>
+<div id="debug-panel">
+  <div class="debug-header">
+    <div class="debug-header-title">Error Log</div>
+    <button class="debug-clear-btn" onclick="clearDebugLog()">Clear</button>
+    <button class="debug-close-btn" onclick="toggleDebug()">×</button>
+  </div>
+  <div id="debug-entries"></div>
+</div>
+
+<script>
+let _debugOpen = false;
+
+async function loadDebugLog() {
+  try {
+    const res = await fetch('/api/debug_log');
+    const entries = await res.json();
+    const btn = document.getElementById('debug-btn');
+    btn.classList.toggle('has-errors', entries.length > 0);
+    btn.textContent = entries.length > 0 ? `🐛 Debug (${entries.length})` : '🐛 Debug';
+    const el = document.getElementById('debug-entries');
+    if (!entries.length) {
+      el.innerHTML = '<div class="debug-empty">No errors logged.</div>';
+      return;
+    }
+    el.innerHTML = entries.map((e, i) => `
+      <div class="debug-entry">
+        <div class="debug-entry-head" onclick="toggleDebugEntry(${i})">
+          <span class="debug-ts">${esc(e.timestamp)}</span>
+          <span class="debug-ep">${esc(e.endpoint)}</span>
+          <span class="debug-msg">${esc(e.type)}: ${esc(e.error)}</span>
+          <span class="debug-toggle" id="dbg-tog-${i}">▼</span>
+        </div>
+        <div class="debug-entry-body" id="dbg-body-${i}">
+          <pre class="debug-tb">${esc(e.traceback||'')}</pre>
+        </div>
+      </div>`).join('');
+  } catch(err) {
+    document.getElementById('debug-entries').innerHTML = '<div class="debug-empty">Could not load log.</div>';
+  }
+}
+
+function toggleDebugEntry(i) {
+  const body = document.getElementById(`dbg-body-${i}`);
+  const tog  = document.getElementById(`dbg-tog-${i}`);
+  const open = body.classList.toggle('open');
+  tog.textContent = open ? '▲' : '▼';
+}
+
+function toggleDebug() {
+  _debugOpen = !_debugOpen;
+  document.getElementById('debug-panel').classList.toggle('open', _debugOpen);
+  if (_debugOpen) loadDebugLog();
+}
+
+async function clearDebugLog() {
+  await fetch('/api/debug_log', {method:'DELETE'});
+  loadDebugLog();
+}
+
+// Poll for new errors every 10s so the button badge stays current
+setInterval(() => {
+  fetch('/api/debug_log').then(r => r.json()).then(entries => {
+    const btn = document.getElementById('debug-btn');
+    btn.classList.toggle('has-errors', entries.length > 0);
+    btn.textContent = entries.length > 0 ? `🐛 Debug (${entries.length})` : '🐛 Debug';
+    if (_debugOpen) loadDebugLog();
+  }).catch(()=>{});
+}, 10000);
+</script>
 </body>
 </html>
 """
