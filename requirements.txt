@@ -3,3 +3,4 @@ trimesh
 networkx
 rtree
 numpy
+scipy

@@ -226,17 +226,31 @@ def auto_orient(input_path, tmpdir):
 # ── Build-volume overflow detection & splitting (trimesh) ─────────────────────
 
 def get_mesh_bounds(stl_path):
-    """Return (size_x, size_y, size_z) of the model using PrusaSlicer --info."""
+    """Return (size_x, size_y, size_z) of the model.
+    Tries PrusaSlicer --info first, falls back to trimesh for formats it can't parse."""
     result = run_slicer("--info", stl_path)
     sx = sy = sz = None
     for line in result.stdout.splitlines():
         if line.startswith("size_x"):
-            sx = float(line.split("=")[1])
+            try: sx = float(line.split("=")[1])
+            except ValueError: pass
         elif line.startswith("size_y"):
-            sy = float(line.split("=")[1])
+            try: sy = float(line.split("=")[1])
+            except ValueError: pass
         elif line.startswith("size_z"):
-            sz = float(line.split("=")[1])
-    return sx, sy, sz
+            try: sz = float(line.split("=")[1])
+            except ValueError: pass
+    if sx is not None:
+        return sx, sy, sz
+    # PrusaSlicer --info failed (e.g. OBJ with excessive line length) — try trimesh
+    try:
+        import trimesh as tm
+        mesh = tm.load(stl_path, force="mesh")
+        ext = mesh.extents
+        return float(ext[0]), float(ext[1]), float(ext[2])
+    except Exception:
+        pass
+    return None, None, None
 
 
 def _split_mesh_along_axis(mesh, axis, cut_pos, piece_dir, base_name, piece_index):
@@ -668,17 +682,20 @@ def api_check_size():
         file.save(input_path)
         sx, sy, sz = get_mesh_bounds(input_path)
     result = {"filename": file.filename, "size": None, "build_vol": None, "overflow_warning": None}
-    if sx is not None:
-        result["size"] = {"x": round(sx, 1), "y": round(sy, 1), "z": round(sz, 1)}
-        if printer:
-            bv = get_build_volume(printer)
-            result["build_vol"] = bv
-            over = []
-            if sx > bv["x"]: over.append(f"X {sx:.0f} > {bv['x']:.0f} mm")
-            if sy > bv["y"]: over.append(f"Y {sy:.0f} > {bv['y']:.0f} mm")
-            if sz > bv["z"]: over.append(f"Z {sz:.0f} > {bv['z']:.0f} mm")
-            if over:
-                result["overflow_warning"] = f"Exceeds build volume ({', '.join(over)})"
+    if sx is None:
+        result["overflow_warning"] = "Could not read model dimensions — size check skipped. Verify the file fits before slicing."
+        result["parse_failed"] = True
+        return jsonify(result)
+    result["size"] = {"x": round(sx, 1), "y": round(sy, 1), "z": round(sz, 1)}
+    if printer:
+        bv = get_build_volume(printer)
+        result["build_vol"] = bv
+        over = []
+        if sx > bv["x"]: over.append(f"X {sx:.0f} > {bv['x']:.0f} mm")
+        if sy > bv["y"]: over.append(f"Y {sy:.0f} > {bv['y']:.0f} mm")
+        if sz > bv["z"]: over.append(f"Z {sz:.0f} > {bv['z']:.0f} mm")
+        if over:
+            result["overflow_warning"] = f"Exceeds build volume ({', '.join(over)})"
     return jsonify(result)
 
 
@@ -1821,16 +1838,18 @@ async function runBatch() {
         const sz = sc.size ? `${sc.size.x}×${sc.size.y}×${sc.size.z} mm` : '';
         const bv = sc.build_vol ? `build volume: ${sc.build_vol.x}×${sc.build_vol.y}×${sc.build_vol.z} mm` : '';
         const ov = item.sizeOverride || 'warn';
+        const parseFailed = sc.parse_failed === true;
+        const actions = parseFailed
+          ? `<button class="pf-btn active" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`
+          : `<button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
+            <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
+            <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>`;
         return `<div class="preflight-file" id="pf-${idx}">
           <div class="preflight-info">
             <strong>${esc(item.file.name)}</strong> — ${esc(sc.overflow_warning||'')}
             <small>${sz}${bv ? ' · ' + bv : ''}</small>
           </div>
-          <div class="preflight-actions">
-            <button class="pf-btn${ov==='scale_fit'?' active':''}" onclick="setPfOverride(${idx},'scale_fit')">Scale to Fit</button>
-            <button class="pf-btn${ov==='split'?' active':''}" onclick="setPfOverride(${idx},'split')">Auto-Split</button>
-            <button class="pf-btn${ov==='warn'?' active':''}" onclick="setPfOverride(${idx},'warn')">Quote Anyway</button>
-          </div>
+          <div class="preflight-actions">${actions}</div>
         </div>`;
       }).join('');
       // Store reference to oversized items for confirmPreflight
