@@ -1924,4 +1924,5 @@ if __name__ == "__main__":
     print(f"Starting 3D Print Quoting GUI at http://localhost:{PORT}")
     print("Press Ctrl+C to stop.\n")
     threading.Thread(target=open_browser, daemon=True).start()
-    app.run(port=PORT, debug=False)
+    host = "0.0.0.0" if os.environ.get("DOCKER") else "127.0.0.1"
+    app.run(host=host, port=PORT, debug=False)
