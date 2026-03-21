@@ -1127,16 +1127,21 @@ HTML = """<!DOCTYPE html>
   .preset-btn.save-btn { border-color:rgba(78,205,196,.4); color:var(--accent2); width:100%; padding:0.5rem; margin-bottom:0.75rem; }
   .preset-btn.save-btn:hover { background:rgba(78,205,196,.08); }
   #file-queue { margin-top:0.75rem; display:none; }
-  .queue-item { display:flex; align-items:center; gap:0.5rem; background:var(--input-bg); border:1px solid var(--border); border-radius:7px; padding:0.4rem 0.75rem; margin-bottom:0.3rem; font-size:0.8rem; }
-  .queue-item.st-slicing { border-color:var(--accent); }
-  .queue-item.st-done    { border-color:#51cf66; }
-  .queue-item.st-error   { border-color:#ff6b6b; }
+  .queue-item { display:flex; align-items:center; gap:0.5rem; background:var(--input-bg); border:1px solid var(--border); border-radius:7px; padding:0.4rem 0.75rem; margin-bottom:0.3rem; font-size:0.8rem; cursor:pointer; transition:border-color .15s, background .15s; }
+  .queue-item:hover        { background:rgba(108,99,255,.07); }
+  .queue-item.selected     { border-color:var(--accent); background:rgba(108,99,255,.1); }
+  .queue-item.st-slicing   { border-color:var(--accent); }
+  .queue-item.st-done      { border-color:#51cf66; }
+  .queue-item.st-error     { border-color:#ff6b6b; }
   .queue-fname  { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); }
   .queue-status { font-size:0.7rem; font-weight:700; letter-spacing:.04em; color:var(--muted); flex-shrink:0; }
   .queue-status.st-pending  { color:var(--muted); }
   .queue-status.st-slicing  { color:var(--accent); }
   .queue-status.st-done     { color:#51cf66; }
   .queue-status.st-error    { color:#ff6b6b; }
+  .queue-badge  { font-size:0.65rem; color:var(--accent); flex-shrink:0; }
+  .queue-del    { background:none; border:none; color:var(--muted); cursor:pointer; font-size:0.85rem; padding:0 0.2rem; line-height:1; flex-shrink:0; }
+  .queue-del:hover { color:#ff6b6b; }
   .queue-clear { background:none; border:none; color:var(--muted); cursor:pointer; font-size:0.75rem; padding:0.1rem 0.3rem; border-radius:4px; }
   .queue-clear:hover { color:#ff6b6b; }
   .batch-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-top:0.5rem; }
@@ -1302,13 +1307,13 @@ HTML = """<!DOCTYPE html>
       <div id="placeholder" class="placeholder">
         <div class="placeholder-icon">📐</div>
         <div class="placeholder-text">Upload a model and hit <strong>Generate Quote</strong></div>
-        <div id="batch-results" style="display:none;margin-top:1rem">
-          <div class="card-title" style="margin-bottom:0.5rem">Batch Summary</div>
-          <table class="batch-table">
-            <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th></tr></thead>
-            <tbody id="batch-tbody"></tbody>
-          </table>
-        </div>
+      </div>
+      <div id="batch-results" style="display:none;margin-top:1rem">
+        <div class="card-title" style="margin-bottom:0.5rem">Batch Summary</div>
+        <table class="batch-table">
+          <thead><tr><th>File</th><th>Time</th><th>Weight</th><th>Cost</th></tr></thead>
+          <tbody id="batch-tbody"></tbody>
+        </table>
       </div>
 
       <div id="results">
@@ -1461,30 +1466,101 @@ function updateRunBtn() {
   document.getElementById('run-btn').disabled = !selectedFile;
 }
 
-let fileQueue = [];   // {file, status:'pending'|'slicing'|'done'|'error', result}
+let fileQueue = [];        // {file, status, result, settings:null|{...}}
+let selectedQueueIdx = -1; // which queue item is active in the settings panel
 
-function buildFormData(file) {
-  const pp = document.getElementById('print-profile-sel').value;
-  const fp = document.getElementById('filament-sel').value;
+function getFormSettings() {
+  return {
+    printer:       document.getElementById('printer-sel').value,
+    print_profile: document.getElementById('print-profile-sel').value,
+    filament:      document.getElementById('filament-sel').value,
+    size_mode:     sizeMode,
+    size_val:      document.getElementById('size-val').value,
+    infill:        document.getElementById('infill').value,
+    layer_height:  document.getElementById('layer-height').value,
+    walls:         document.getElementById('walls').value,
+    supports:      supportMode,
+    auto_orient:   document.getElementById('auto-orient').checked,
+    auto_split:    document.getElementById('auto-split').checked,
+    time_factor:   document.getElementById('time-factor').value || '1.0',
+    cost_per_kg:   document.getElementById('cost-per-kg').value,
+    hourly_rate:   document.getElementById('hourly-rate').value,
+    markup:        document.getElementById('markup').value,
+    quantity:      document.getElementById('quantity').value,
+    farm_size:     document.getElementById('farm-size').value || '1',
+  };
+}
+
+async function applyFormSettings(s) {
+  const printerSel = document.getElementById('printer-sel');
+  if (printerSel.value !== s.printer) {
+    printerSel.value = s.printer;
+    await loadProfiles();
+  }
+  document.getElementById('print-profile-sel').value = s.print_profile;
+  document.getElementById('filament-sel').value      = s.filament;
+  setSizeMode(s.size_mode);
+  document.getElementById('size-val').value      = s.size_val;
+  document.getElementById('infill').value        = s.infill;
+  document.getElementById('layer-height').value  = s.layer_height;
+  document.getElementById('walls').value         = s.walls;
+  setSupportMode(s.supports);
+  document.getElementById('auto-orient').checked = s.auto_orient;
+  document.getElementById('auto-split').checked  = s.auto_split;
+  toggleFeature('orient-row', 'auto-orient');
+  toggleFeature('split-row',  'auto-split');
+  document.getElementById('time-factor').value  = s.time_factor;
+  document.getElementById('cost-per-kg').value  = s.cost_per_kg;
+  document.getElementById('hourly-rate').value  = s.hourly_rate;
+  document.getElementById('markup').value       = s.markup;
+  document.getElementById('quantity').value     = s.quantity;
+  document.getElementById('farm-size').value    = s.farm_size;
+}
+
+async function selectQueueItem(i) {
+  // Save current form into the previously selected item
+  if (selectedQueueIdx >= 0 && selectedQueueIdx < fileQueue.length) {
+    fileQueue[selectedQueueIdx].settings = getFormSettings();
+  }
+  selectedQueueIdx = i;
+  const item = fileQueue[i];
+  if (item.settings) await applyFormSettings(item.settings);
+  renderQueue();
+}
+
+function deleteQueueItem(i) {
+  fileQueue.splice(i, 1);
+  if (selectedQueueIdx === i)      selectedQueueIdx = -1;
+  else if (selectedQueueIdx > i)   selectedQueueIdx--;
+  if (fileQueue.length === 0) { clearQueue(); return; }
+  selectedFile = fileQueue[0]?.file || null;
+  renderQueue();
+  const btn = document.getElementById('run-btn');
+  btn.disabled  = fileQueue.length === 0;
+  btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
+}
+
+function buildFormData(file, settings) {
+  const s  = settings || getFormSettings();
   const fd = new FormData();
   fd.append('file',          file);
-  fd.append('printer',       document.getElementById('printer-sel').value);
-  fd.append('print_profile', pp);
-  fd.append('filament',      fp);
-  fd.append('size_mode',     sizeMode);
-  fd.append('size_val',      document.getElementById('size-val').value);
-  fd.append('infill',        document.getElementById('infill').value);
-  fd.append('layer_height',  document.getElementById('layer-height').value);
-  fd.append('walls',         document.getElementById('walls').value);
-  fd.append('supports',      supportMode);
-  fd.append('cost_per_kg',   document.getElementById('cost-per-kg').value);
-  fd.append('hourly_rate',   document.getElementById('hourly-rate').value);
-  fd.append('markup',        document.getElementById('markup').value);
-  fd.append('quantity',      document.getElementById('quantity').value);
-  fd.append('farm_size',     document.getElementById('farm-size').value || '1');
-  fd.append('auto_orient',   document.getElementById('auto-orient').checked ? 'true' : 'false');
-  fd.append('auto_split',    document.getElementById('auto-split').checked  ? 'true' : 'false');
-  fd.append('time_factor',   document.getElementById('time-factor').value || '1.0');
+  fd.append('printer',       s.printer);
+  fd.append('print_profile', s.print_profile);
+  fd.append('filament',      s.filament);
+  fd.append('size_mode',     s.size_mode);
+  fd.append('size_val',      s.size_val);
+  fd.append('infill',        s.infill);
+  fd.append('layer_height',  s.layer_height);
+  fd.append('walls',         s.walls);
+  fd.append('supports',      s.supports);
+  fd.append('cost_per_kg',   s.cost_per_kg);
+  fd.append('hourly_rate',   s.hourly_rate);
+  fd.append('markup',        s.markup);
+  fd.append('quantity',      s.quantity);
+  fd.append('farm_size',     s.farm_size);
+  fd.append('auto_orient',   s.auto_orient ? 'true' : 'false');
+  fd.append('auto_split',    s.auto_split  ? 'true' : 'false');
+  fd.append('time_factor',   s.time_factor);
   return fd;
 }
 
@@ -1503,14 +1579,16 @@ function renderQueue() {
   qDiv.style.display = 'block';
   document.getElementById('queue-count').textContent = fileQueue.length;
   document.getElementById('queue-list').innerHTML = fileQueue.map((item, i) =>
-    `<div class="queue-item st-${item.status}">
+    `<div class="queue-item st-${item.status}${selectedQueueIdx===i?' selected':''}" onclick="selectQueueItem(${i})">
        <span class="queue-fname" title="${esc(item.file.name)}">${esc(item.file.name)}</span>
+       ${item.settings ? '<span class="queue-badge" title="Custom settings">⚙</span>' : ''}
        <span class="queue-status st-${item.status}">${item.status}</span>
+       <button class="queue-del" title="Remove" onclick="event.stopPropagation();deleteQueueItem(${i})">×</button>
      </div>`).join('');
 }
 
 function clearQueue() {
-  fileQueue = []; selectedFile = null;
+  fileQueue = []; selectedFile = null; selectedQueueIdx = -1;
   renderQueue();
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
@@ -1578,12 +1656,17 @@ async function runBatch() {
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('batch-results').style.display = 'none';
   saveInputs();
+  // Save current form into whichever item is selected so its settings are captured
+  if (selectedQueueIdx >= 0 && selectedQueueIdx < fileQueue.length) {
+    fileQueue[selectedQueueIdx].settings = getFormSettings();
+  }
   for (let i = 0; i < fileQueue.length; i++) {
     const item = fileQueue[i];
+    if (item.status === 'done') continue;   // already quoted, skip
     item.status = 'slicing'; renderQueue();
     btn.innerHTML = `<span class="spinner"></span> ${i+1}/${fileQueue.length} Quoting…`;
     try {
-      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file)});
+      const res  = await fetch('/api/quote', {method:'POST', body: buildFormData(item.file, item.settings)});
       const data = await res.json();
       item.status = res.ok ? 'done' : 'error';
       item.result = data;
