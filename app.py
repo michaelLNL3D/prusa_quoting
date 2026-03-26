@@ -31,21 +31,42 @@ PORT = int(os.environ.get("PORT", 5111))
 EXPORT_DIR = os.path.join(tempfile.gettempdir(), "prusaquoting_exports")
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-# Last-job state for 3MF export (in-memory, single-user tool)
-_last_job = {}   # {input_path, printer, print_prof, filament, infill, layer_h, walls, supports, size_val, size_mode, filename}
-_jobs     = {}   # job_id -> {gcode_paths, filename}  (last 50 jobs)
+# Job state (in-memory, last 50 jobs)
+# Each job: {gcode_paths, filename, input_path, work_path, resolved_config, printer, print_prof, ...}
+_jobs     = {}
+
+def _cleanup_job_files(job):
+    """Delete persistent files associated with an evicted job."""
+    for key in ("input_path", "work_path", "resolved_config"):
+        path = job.get(key)
+        if path and os.path.exists(path):
+            try: os.remove(path)
+            except OSError: pass
+    for _, gpath in job.get("gcode_paths", []):
+        if gpath and os.path.exists(gpath):
+            try: os.remove(gpath)
+            except OSError: pass
 
 # In-memory error log (last 100 entries)
 _error_log = []
 
-# In-memory progress tracking: pid -> list of {label, status, detail}
+# In-memory progress tracking: pid -> {ts, steps}
 _progress = {}
+_PROGRESS_TTL = 300  # seconds — evict entries older than 5 minutes
 
 def _emit(pid, label, status, detail=None):
     """Emit a progress step. If a step with the same label exists, update it in-place."""
     if not pid:
         return
-    steps = _progress.setdefault(pid, [])
+    import time as _time
+    now = _time.time()
+    # Evict stale entries
+    stale = [k for k, v in _progress.items() if now - v["ts"] > _PROGRESS_TTL]
+    for k in stale:
+        del _progress[k]
+    entry = _progress.setdefault(pid, {"ts": now, "steps": []})
+    entry["ts"] = now
+    steps = entry["steps"]
     for s in reversed(steps):
         if s["label"] == label:
             s["status"] = status
@@ -66,10 +87,18 @@ def _log_error(endpoint, error, tb=None, params=None):
         _error_log.pop(0)
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB upload limit
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
 @app.errorhandler(Exception)
 def handle_unhandled_exception(e):
     """Catch all unhandled exceptions, log them, and return JSON instead of HTML."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify({"error": str(e)}), e.code
     tb = traceback.format_exc()
     _log_error(request.path, e, tb, {"method": request.method})
     return jsonify({"error": str(e), "type": type(e).__name__}), 500
@@ -78,9 +107,13 @@ def handle_unhandled_exception(e):
 # ── Slicer helpers ────────────────────────────────────────────────────────────
 
 def run_slicer(*args):
+    if not os.path.exists(PRUSASLICER):
+        raise RuntimeError(f"PrusaSlicer not found at {PRUSASLICER}. Set PRUSASLICER_PATH env var.")
     return subprocess.run([PRUSASLICER] + list(args), capture_output=True, text=True)
 
 def run_orca(*args):
+    if not os.path.exists(ORCASLICER):
+        raise RuntimeError(f"OrcaSlicer not found at {ORCASLICER}. Set ORCASLICER_PATH env var.")
     return subprocess.run([ORCASLICER] + list(args), capture_output=True, text=True)
 
 
@@ -169,10 +202,15 @@ def _all_printer_sections():
     return all_sections
 
 
-def _resolve_key(sections, section_name, key, depth=0):
+def _resolve_key(sections, section_name, key, depth=0, _visited=None):
     """Walk the inherits chain to find a config key value."""
     if depth > 8:
         return None
+    if _visited is None:
+        _visited = set()
+    if section_name in _visited:
+        return None  # circular reference
+    _visited.add(section_name)
     kv = sections.get(section_name, {})
     if key in kv:
         return kv[key]
@@ -188,7 +226,7 @@ def _resolve_key(sections, section_name, key, depth=0):
             f"*{parent}*",
             f"printer:*{parent}*",
         ]:
-            val = _resolve_key(sections, candidate, key, depth + 1)
+            val = _resolve_key(sections, candidate, key, depth + 1, _visited)
             if val is not None:
                 return val
     return None
@@ -238,15 +276,20 @@ def auto_orient(input_path, tmpdir):
     Returns (oriented_stl_path, orientation_note).
     Falls back to input_path on failure.
     """
-    out_root = os.path.join(tmpdir, "oriented")
+    # Each piece gets its own output subdir so glob never picks up a sibling's file
+    piece_name = Path(input_path).stem
+    out_root = os.path.join(tmpdir, "oriented", piece_name)
     os.makedirs(os.path.join(out_root, "stl"), exist_ok=True)
 
-    result = run_orca(
-        "--orient", "1",
-        "--export-stl",
-        "--outputdir", out_root,
-        input_path,
-    )
+    try:
+        result = run_orca(
+            "--orient", "1",
+            "--export-stl",
+            "--outputdir", out_root,
+            input_path,
+        )
+    except (RuntimeError, OSError) as e:
+        return input_path, f"orient skipped ({e})"
 
     # Parse best orientation from stdout
     best_line = ""
@@ -287,8 +330,8 @@ def get_mesh_bounds(stl_path):
         mesh = tm.load(stl_path, force="mesh")
         ext = mesh.extents
         return float(ext[0]), float(ext[1]), float(ext[2])
-    except Exception:
-        pass
+    except Exception as e:
+        _log_error("get_mesh_bounds", e)
     return None, None, None
 
 
@@ -312,8 +355,8 @@ def _split_mesh_along_axis(mesh, axis, cut_pos, piece_dir, base_name, piece_inde
             half = tm.intersections.slice_mesh_plane(mesh, normal, origin, cap=True)
             if half is not None and len(half.faces) > 0:
                 results.append((half, label))
-        except Exception:
-            pass
+        except Exception as e:
+            _log_error("_split_mesh_along_axis", e)
     return results
 
 
@@ -337,7 +380,8 @@ def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
 
     try:
         mesh = tm.load(stl_path, force="mesh")
-    except Exception:
+    except Exception as e:
+        _log_error("split_if_needed", e)
         return [(stl_path, "whole")]
     bv   = build_vol
 
@@ -352,9 +396,12 @@ def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
     os.makedirs(piece_dir, exist_ok=True)
     base_name = Path(stl_path).stem
 
+    piece_counter = [0]
+
     def try_split(mesh_in, depth=0):
         if mesh_fits(mesh_in) or depth > 6:
-            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
+            piece_counter[0] += 1
+            out_path = os.path.join(piece_dir, f"{base_name}_p{piece_counter[0]:03d}.stl")
             _translate_to_origin(mesh_in)
             mesh_in.export(out_path)
             return [out_path]
@@ -367,7 +414,8 @@ def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
             reverse=True
         )
         if not overflow:
-            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
+            piece_counter[0] += 1
+            out_path = os.path.join(piece_dir, f"{base_name}_p{piece_counter[0]:03d}.stl")
             _translate_to_origin(mesh_in)
             mesh_in.export(out_path)
             return [out_path]
@@ -378,14 +426,14 @@ def split_if_needed(stl_path, build_vol, tmpdir, do_orient=False):
 
         halves = _split_mesh_along_axis(mesh_in, ax, cut_pos, piece_dir, base_name, depth)
         if len(halves) < 2:
-            out_path = os.path.join(piece_dir, f"{base_name}_d{depth}_{id(mesh_in)}.stl")
+            piece_counter[0] += 1
+            out_path = os.path.join(piece_dir, f"{base_name}_p{piece_counter[0]:03d}.stl")
             _translate_to_origin(mesh_in)
             mesh_in.export(out_path)
             return [out_path]
 
         results = []
         for half_mesh, _ in halves:
-            _translate_to_origin(half_mesh)
             results.extend(try_split(half_mesh, depth + 1))
         return results
 
@@ -415,7 +463,8 @@ def parse_size(size_str, mode):
         return ["--scale-to-fit", ",".join(str(p) for p in parts)]
     else:
         s = str(size_str).strip().rstrip("%")
-        return ["--scale", s]
+        ratio = float(s) / 100  # UI shows percentage, PrusaSlicer expects ratio
+        return ["--scale", str(ratio)]
 
 
 # ── Gcode parsing ─────────────────────────────────────────────────────────────
@@ -525,12 +574,16 @@ def _profile_flags(printer, print_prof, filament):
     return cmd
 
 
+_VALID_SUPPORT_MODES = {"", "none", "grid", "snug", "organic"}
+
 def _override_flags(infill, layer_h, walls, supports):
     """Return CLI flags for print overrides."""
     cmd = []
     if infill:  cmd += ["--fill-density", infill if infill.endswith("%") else infill + "%"]
     if layer_h: cmd += ["--layer-height", layer_h]
     if walls:   cmd += ["--perimeters",   walls]
+    if supports and supports not in _VALID_SUPPORT_MODES:
+        supports = ""  # ignore invalid values
     if supports and supports != "none":
         cmd += ["--support-material", "--support-material-auto",
                 "--support-material-style", supports]
@@ -673,13 +726,18 @@ def api_profiles():
 PRESETS_FILE = os.environ.get("PRESETS_FILE", os.path.expanduser("~/.prusaquoting_presets.json"))
 PRESET_KEYS  = ["printer", "print_profile", "filament", "infill",
                 "layer_height", "walls", "supports",
-                "cost_per_kg", "hourly_rate", "markup", "farm_size"]
+                "cost_per_kg", "hourly_rate", "markup", "farm_size",
+                "time_factor", "size_mode", "size_val", "quantity",
+                "auto_orient", "auto_split", "auto_scale_fit"]
 
 def _load_presets():
     try:
         with open(PRESETS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except json.JSONDecodeError as e:
+        _log_error("_load_presets", e)
+        return {}
+    except OSError:
         return {}
 
 def _save_presets(data):
@@ -722,7 +780,8 @@ def api_debug_log_clear():
 
 @app.route("/api/progress/<pid>", methods=["GET"])
 def api_progress_get(pid):
-    return jsonify(_progress.get(pid, []))
+    entry = _progress.get(pid)
+    return jsonify(entry["steps"] if entry else [])
 
 @app.route("/api/progress/<pid>", methods=["DELETE"])
 def api_progress_delete(pid):
@@ -739,6 +798,9 @@ def api_check_size():
     if not file:
         return jsonify({"error": "No file"}), 400
     suffix = Path(file.filename).suffix.lower()
+    allowed = {".stl", ".obj", ".3mf", ".amf", ".step", ".stp"}
+    if suffix not in allowed:
+        return jsonify({"error": f"Unsupported file type '{suffix}'"}), 400
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "check" + suffix)
         file.save(input_path)
@@ -810,8 +872,10 @@ def api_check_size():
                 elif face_count > 500_000:
                     mesh_warnings.append(f"High polygon count ({face_count:,} faces) — slicing may be slow.")
 
-        except Exception:
-            pass  # trimesh unavailable or can't parse — skip health checks
+        except ImportError:
+            pass  # trimesh not installed — skip health checks
+        except Exception as e:
+            _log_error("check_size_health", e)  # log unexpected failures
 
     result = {"filename": file.filename, "size": None, "build_vol": None,
               "overflow_warning": None, "mesh_warnings": mesh_warnings}
@@ -851,7 +915,7 @@ def api_quote():
     cost_per_kg  = form.get("cost_per_kg", "").strip()
     hourly_rate  = form.get("hourly_rate", "").strip()
     markup       = form.get("markup", "").strip()
-    quantity     = int(form.get("quantity", 1) or 1)
+    quantity     = max(1, int(form.get("quantity", 1) or 1))
     time_factor  = float(form.get("time_factor", 1.0) or 1.0)
     farm_size    = max(1, int(form.get("farm_size", 1) or 1))
     do_orient     = form.get("auto_orient")    == "true"
@@ -860,14 +924,19 @@ def api_quote():
     pid           = form.get("progress_id", "")
 
     suffix = Path(file.filename).suffix.lower()
+    allowed = {".stl", ".obj", ".3mf", ".amf", ".step", ".stp"}
+    if suffix not in allowed:
+        return jsonify({"error": f"Unsupported file type '{suffix}'. Allowed: {', '.join(sorted(allowed))}"}), 400
     _emit(pid, "Saving file", "done", file.filename)
 
-    # Save a persistent copy for 3MF export
+    # Save a persistent copy for 3MF export (per-job, not global)
     import shutil
-    persistent_input = os.path.join(EXPORT_DIR, "last_input" + suffix)
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())[:8]
+    persistent_input = os.path.join(EXPORT_DIR, f"{job_id}_input{suffix}")
     file.seek(0)
     file.save(persistent_input)
-    _last_job.update({
+    _job_export = {
         "input_path": persistent_input,
         "filename":   file.filename,
         "printer":    printer,
@@ -879,7 +948,7 @@ def api_quote():
         "supports":   supports,
         "size_val":   size_val,
         "size_mode":  size_mode,
-    })
+    }
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input" + suffix)
@@ -974,19 +1043,17 @@ def api_quote():
 
         # Persist the work_path (post-orient/scale) for 3MF export
         work_suffix = Path(work_path).suffix or ".stl"
-        persistent_work = os.path.join(EXPORT_DIR, "last_work" + work_suffix)
+        persistent_work = os.path.join(EXPORT_DIR, f"{job_id}_work{work_suffix}")
         shutil.copy2(work_path, persistent_work)
-        _last_job["work_path"] = persistent_work
+        _job_export["work_path"] = persistent_work
         if machine_limits_ini and os.path.exists(machine_limits_ini):
-            persistent_cfg = os.path.join(EXPORT_DIR, "last_machine_limits.ini")
+            persistent_cfg = os.path.join(EXPORT_DIR, f"{job_id}_machine_limits.ini")
             shutil.copy2(machine_limits_ini, persistent_cfg)
-            _last_job["resolved_config"] = persistent_cfg
+            _job_export["resolved_config"] = persistent_cfg
         else:
-            _last_job["resolved_config"] = None
+            _job_export["resolved_config"] = None
 
         # ── Slice each piece ──────────────────────────────────────────────────
-        import uuid as _uuid
-        job_id = str(_uuid.uuid4())[:8]
 
         piece_results = []
         errors_out    = []
@@ -1013,10 +1080,9 @@ def api_quote():
                 piece_results.append({"label": piece_label, "stats": stats})
                 gcode_paths.append((piece_label, persistent_gcode))
             except RuntimeError as e:
+                _log_error("slice_piece", e)
                 _emit(pid, step_label, "error", str(e))
                 errors_out.append(f"{piece_label}: {e}")
-
-        _last_job["gcode_paths"] = gcode_paths
 
         if not piece_results:
             return jsonify({
@@ -1068,23 +1134,44 @@ def api_quote():
         machine_cost = (total_mins / 60) * float(hourly_rate)
 
     subtotal    = (material_cost or 0) + (machine_cost or 0)
-    quote_price = subtotal * (1 + float(markup) / 100) if markup and subtotal else None
+    unit_price  = subtotal * (1 + float(markup) / 100) if markup not in (None, "") and subtotal else None
 
     qty_time   = mins_to_str(total_mins * quantity) if quantity > 1 else None
     qty_weight = round(total_g * quantity, 1)       if quantity > 1 else None
 
     import math as _math
     farm_time = None
+    batches = 1
     if farm_size > 1 and total_mins > 0:
         batches   = _math.ceil(quantity / farm_size)
         farm_time = mins_to_str(total_mins * batches)
 
+    # Total price accounts for quantity (material × qty, machine × batches/qty)
+    if quantity > 1:
+        qty_material = (material_cost * quantity) if material_cost else None
+        if farm_size > 1 and hourly_rate and total_mins:
+            qty_machine = (total_mins * batches / 60) * float(hourly_rate)
+        else:
+            qty_machine = (machine_cost * quantity) if machine_cost else None
+        qty_subtotal = (qty_material or 0) + (qty_machine or 0)
+        total_price = qty_subtotal * (1 + float(markup) / 100) if markup not in (None, "") and qty_subtotal is not None else None
+    else:
+        qty_material = None
+        qty_machine  = None
+        qty_subtotal = None
+        total_price  = None
+
+    quote_price = total_price if quantity > 1 else unit_price
+
     price_str = f"${quote_price:.2f}" if quote_price else (f"${subtotal:.2f}" if subtotal else "")
     _emit(pid, "Calculating quote", "done", price_str)
 
-    _jobs[job_id] = {"gcode_paths": gcode_paths, "filename": file.filename}
+    _job_export["gcode_paths"] = gcode_paths
+    _jobs[job_id] = _job_export
     if len(_jobs) > 50:
-        del _jobs[next(iter(_jobs))]
+        evicted = next(iter(_jobs))
+        _cleanup_job_files(_jobs[evicted])
+        del _jobs[evicted]
 
     return jsonify({
         "filename":       file.filename,
@@ -1110,10 +1197,14 @@ def api_quote():
         "subtotal":       round(subtotal, 2)   if subtotal  else None,
         "markup_pct":     float(markup)        if markup    else None,
         "markup_amt":     round(subtotal * float(markup) / 100, 2) if markup and subtotal else None,
+        "unit_price":     round(unit_price, 2) if unit_price else None,
         "quote_price":    round(quote_price, 2) if quote_price else None,
         "quantity":       quantity,
         "qty_time":       qty_time,
         "qty_weight_g":   qty_weight,
+        "qty_material":   round(qty_material, 2) if qty_material else None,
+        "qty_machine":    round(qty_machine,  2) if qty_machine  else None,
+        "qty_subtotal":   round(qty_subtotal, 2) if qty_subtotal else None,
         "cost_per_kg":    float(cost_per_kg)  if cost_per_kg  else None,
         "hourly_rate":    float(hourly_rate)  if hourly_rate  else None,
         "errors":           errors_out,
@@ -1125,13 +1216,15 @@ def api_quote():
 
 @app.route("/api/export_3mf", methods=["POST"])
 def api_export_3mf():
-    """Export last job as a 3MF project file using the exact model and resolved config used for quoting."""
-    # Use post-orient/scale work_path if available, otherwise fall back to original input
-    model_path = _last_job.get("work_path") or _last_job.get("input_path")
+    """Export a job as a 3MF project file using the exact model and resolved config used for quoting."""
+    body = request.get_json(force=True) if request.is_json else {}
+    job_id = body.get("job_id") or request.form.get("job_id", "")
+    j = _jobs.get(job_id, {})
+    if not j:
+        return jsonify({"error": "Job not found — run a quote first"}), 400
+    model_path = j.get("work_path") or j.get("input_path")
     if not model_path or not os.path.exists(model_path):
-        return jsonify({"error": "No job to export — run a quote first"}), 400
-
-    j = _last_job
+        return jsonify({"error": "Model file no longer available — re-run the quote"}), 400
     out_3mf = os.path.join(EXPORT_DIR, "export.3mf")
 
     if os.path.exists(out_3mf):
@@ -1162,8 +1255,10 @@ def api_export_3mf():
 
 @app.route("/api/export_ini")
 def api_export_ini():
-    """Download the machine limits ini used for the last quote (for debugging)."""
-    cfg = _last_job.get("resolved_config")
+    """Download the machine limits ini used for a quote (for debugging)."""
+    job_id = request.args.get("job_id", "")
+    j = _jobs.get(job_id, {})
+    cfg = j.get("resolved_config")
     if not cfg or not os.path.exists(cfg):
         return jsonify({"error": "No machine limits config — run a quote with a user printer profile first"}), 400
     return send_file(cfg, as_attachment=True, download_name="machine_limits.ini",
@@ -1175,7 +1270,7 @@ def api_export_gcode():
     """Download sliced gcode(s). Pass ?job_id=xxx for a specific quote, or omit for the last one."""
     import zipfile, io
     job_id = request.args.get("job_id")
-    job = (_jobs.get(job_id) if job_id else None) or _last_job
+    job = _jobs.get(job_id, {})
     gcode_paths = job.get("gcode_paths", [])
     gcode_paths = [(lbl, p) for lbl, p in gcode_paths if os.path.exists(p)]
     if not gcode_paths:
@@ -1363,6 +1458,15 @@ HTML = """<!DOCTYPE html>
   .preset-btn.del-btn:hover { border-color:#ff6b6b; color:#ff6b6b; }
   .preset-btn.save-btn { border-color:rgba(78,205,196,.4); color:var(--accent2); width:100%; padding:0.5rem; margin-bottom:0.75rem; }
   .preset-btn.save-btn:hover { background:rgba(78,205,196,.08); }
+  #preset-save-row { display:none; margin-bottom:0.75rem; }
+  #preset-save-row input { margin-bottom:0.4rem; }
+  #preset-save-actions { display:flex; gap:0.4rem; }
+  #preset-delete-confirm { display:none; margin-bottom:0.75rem; background:rgba(255,107,107,.07); border:1px solid rgba(255,107,107,.25); border-radius:8px; padding:0.55rem 0.75rem; font-size:0.78rem; color:var(--text); display:none; align-items:center; gap:0.6rem; flex-wrap:wrap; }
+  #preset-delete-confirm span { flex:1; }
+  .preset-confirm-yes { background:transparent; border:1px solid var(--danger); color:var(--danger); border-radius:5px; padding:0.25rem 0.6rem; font-size:0.72rem; font-weight:700; cursor:pointer; }
+  .preset-confirm-yes:hover { background:rgba(255,107,107,.12); }
+  .preset-confirm-no  { background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:5px; padding:0.25rem 0.6rem; font-size:0.72rem; font-weight:700; cursor:pointer; }
+  .preset-confirm-no:hover { border-color:var(--accent); color:var(--accent); }
   #file-queue { margin-top:0.75rem; display:none; }
   .queue-item { display:flex; align-items:center; gap:0.5rem; background:var(--input-bg); border:1px solid var(--border); border-radius:7px; padding:0.4rem 0.75rem; margin-bottom:0.3rem; font-size:0.8rem; cursor:pointer; transition:border-color .15s, background .15s; }
   .queue-item:hover        { background:rgba(108,99,255,.07); }
@@ -1432,7 +1536,7 @@ HTML = """<!DOCTYPE html>
   .rc-tab.has-warn { border-color:var(--warn); color:var(--warn); }
   .rc-tab.active.has-warn { background:var(--warn); border-color:var(--warn); color:#000; }
   /* Health tab */
-  #health-panel { display:none; }
+  #health-panel { display:none; margin-top:1rem; }
   .health-file { margin-bottom:1rem; padding:0.75rem; background:var(--input-bg); border-radius:8px; border:1px solid var(--border); }
   .health-file.has-issues { border-color:rgba(255,169,77,.35); }
   .health-filename { font-size:0.82rem; font-weight:700; color:var(--text); margin-bottom:0.35rem; display:flex; align-items:center; gap:0.4rem; }
@@ -1486,12 +1590,24 @@ HTML = """<!DOCTYPE html>
     <div>
       <div class="card">
         <div class="card-title">Presets</div>
-          <div class="preset-bar">
+          <div class="preset-bar" id="preset-bar">
             <select id="preset-sel"><option value="">— saved presets —</option></select>
             <button class="preset-btn" onclick="loadPreset()">Load</button>
             <button class="preset-btn del-btn" onclick="deletePreset()">×</button>
           </div>
-          <button class="preset-btn save-btn" onclick="savePreset()">Save Current Settings as Preset…</button>
+          <div id="preset-delete-confirm">
+            <span id="preset-delete-label">Delete preset?</span>
+            <button class="preset-confirm-yes" onclick="confirmDeletePreset()">Delete</button>
+            <button class="preset-confirm-no"  onclick="cancelDeletePreset()">Cancel</button>
+          </div>
+          <div id="preset-save-row">
+            <input type="text" id="preset-name-input" placeholder="Preset name…">
+            <div id="preset-save-actions">
+              <button class="preset-btn save-btn" onclick="confirmSavePreset()" style="margin-bottom:0;flex:1">Save</button>
+              <button class="preset-btn" onclick="cancelSavePreset()">Cancel</button>
+            </div>
+          </div>
+          <button class="preset-btn save-btn" id="preset-save-btn" onclick="savePreset()">Save Current Settings as Preset…</button>
           <div class="card-title">Model File</div>
         <div id="drop-zone">
           <input type="file" id="file-input" accept=".stl,.obj,.3mf,.amf,.step,.stp" multiple>
@@ -1575,9 +1691,18 @@ HTML = """<!DOCTYPE html>
             <input type="number" id="layer-height" placeholder="e.g. 0.20" step="0.01" min="0.05" max="1.0">
           </div>
         </div>
-        <div class="form-group">
-          <label>Wall Count (perimeters)</label>
-          <input type="number" id="walls" placeholder="e.g. 3" min="1" max="20" step="1">
+        <div class="row">
+          <div class="form-group">
+            <label>Wall Count (perimeters)</label>
+            <input type="number" id="walls" placeholder="e.g. 3" min="1" max="20" step="1">
+          </div>
+          <div class="form-group">
+            <label>Time factor
+              <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">calibration</span>
+            </label>
+            <input type="number" id="time-factor" value="1.0" step="0.05" min="0.1" max="3.0"
+              placeholder="1.0 = no adjustment">
+          </div>
         </div>
         <div class="form-group">
           <label>Supports</label>
@@ -1604,28 +1729,20 @@ HTML = """<!DOCTYPE html>
         <div class="row">
           <div class="form-group">
             <label>Markup %</label>
-            <input type="number" id="markup" placeholder="e.g. 40" step="5" min="0">
+            <input type="number" id="markup" placeholder="e.g. 40" step="5" min="0" max="1000">
           </div>
           <div class="form-group">
             <label>Quantity</label>
             <input type="number" id="quantity" value="1" min="1" step="1">
           </div>
         </div>
-        <div class="form-group">
-          <label>Time correction factor
-            <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">&nbsp;— calibrate vs actual prints</span>
-          </label>
-          <input type="number" id="time-factor" value="1.0" step="0.05" min="0.1" max="3.0"
-            placeholder="1.0 = no adjustment">
-        </div>
-
-          <div class="row" style="margin-bottom:0.75rem">
-            <div class="form-group">
-              <label>Farm size <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">printers</span></label>
-              <input type="number" id="farm-size" value="1" min="1" step="1">
-            </div>
+        <div class="row" style="margin-bottom:0.75rem">
+          <div class="form-group">
+            <label>Farm size <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">printers</span></label>
+            <input type="number" id="farm-size" value="1" min="1" step="1">
           </div>
-          <button id="run-btn" onclick="runQuote()" disabled>Generate Quote</button>
+        </div>
+        <button id="run-btn" onclick="runQuote()" disabled title="Upload a model file first">Generate Quote</button>
       </div>
     </div>
 
@@ -1651,9 +1768,9 @@ HTML = """<!DOCTYPE html>
         <div class="placeholder-text">Upload a model and hit <strong>Generate Quote</strong></div>
       </div>
       <div id="preflight-panel">
-        <div class="preflight-title">⚠ Oversize Files Detected</div>
+        <div class="preflight-title" id="preflight-title-text">⚠ Oversize Files Detected</div>
         <div id="preflight-list"></div>
-        <button class="preflight-confirm" onclick="confirmPreflight()">Continue &amp; Quote</button>
+        <button class="preflight-confirm" id="preflight-confirm-btn" onclick="confirmPreflight()">Continue &amp; Quote</button>
       </div>
 
       <div id="batch-results" style="display:none;margin-top:1rem">
@@ -1679,7 +1796,7 @@ HTML = """<!DOCTYPE html>
           </div>
           <button class="copy-btn" onclick="copyQuote()">Copy Quote</button>
           <button class="copy-btn" id="dl-3mf-btn" onclick="download3mf()" style="margin-left:0.4rem">Download 3MF</button>
-          <a class="copy-btn" href="/api/export_gcode" style="margin-left:0.4rem;text-decoration:none;padding:0.35rem 0.7rem">Download GCode</a>
+          <a class="copy-btn" id="dl-gcode-btn" href="/api/export_gcode" style="margin-left:0.4rem;text-decoration:none;padding:0.35rem 0.7rem">Download GCode</a>
         </div>
 
         <div id="farm-row" class="qty-row" style="display:none;border-color:rgba(108,99,255,.2);background:rgba(108,99,255,.04);margin-bottom:0.75rem"></div>
@@ -1740,13 +1857,19 @@ async function init() {
     if (!printersRes.ok) throw new Error('Server returned ' + printersRes.status);
     const printers = await printersRes.json();
     const sel = document.getElementById('printer-sel');
-    sel.innerHTML = '<option value="">— select printer —</option>' +
-      printers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    if (printers.length === 0) {
+      sel.innerHTML = '<option value="">— no printers found —</option>';
+      showError('No printer profiles found. Ensure PrusaSlicer is installed with at least one printer configured.');
+    } else {
+      sel.innerHTML = '<option value="">— select printer —</option>' +
+        printers.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    }
     const last = localStorage.getItem('lastPrinter');
     if (last && printers.includes(last)) { sel.value = last; await loadProfiles(); }
     restoreInputs();
   } catch(e) {
     document.getElementById('printer-sel').innerHTML = '<option value="">— server unreachable —</option>';
+    showError('Could not connect to server. Check that the server is running and reload the page.');
     console.error('init() failed:', e);
   }
 }
@@ -1808,8 +1931,11 @@ dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.class
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop', e => {
     e.preventDefault(); dropZone.classList.remove('dragover');
-    const files = Array.from(e.dataTransfer.files).filter(f => /\\.(stl|obj|3mf|amf|step|stp)$/i.test(f.name));
-    if (files.length) { addFilesToQueue(files); dropZone.classList.add('has-file'); document.getElementById('file-name').textContent = files.length === 1 ? '✓ ' + files[0].name : `✓ ${files.length} files queued`; }
+    const allFiles = Array.from(e.dataTransfer.files);
+    if (allFiles.length === 0) { document.getElementById('file-name').textContent = 'Drop model files here'; return; }
+    const files = allFiles.filter(f => /\\.(stl|obj|3mf|amf|step|stp)$/i.test(f.name));
+    if (files.length === 0) { document.getElementById('file-name').textContent = 'Unsupported file type — use STL, OBJ, 3MF, AMF, or STEP'; setTimeout(() => { if (!selectedFile) document.getElementById('file-name').textContent = ''; }, 3000); return; }
+    addFilesToQueue(files); dropZone.classList.add('has-file'); document.getElementById('file-name').textContent = files.length === 1 ? '✓ ' + files[0].name : `✓ ${files.length} files queued`;
   });
 fileInput.addEventListener('change', () => {
     const files = Array.from(fileInput.files);
@@ -1824,7 +1950,11 @@ function setFile(f) {
   updateRunBtn();
 }
 function updateRunBtn() {
-  document.getElementById('run-btn').disabled = !selectedFile;
+  const hasPrinter = !!document.getElementById('printer-sel').value;
+  const btn = document.getElementById('run-btn');
+  btn.disabled = !selectedFile || !hasPrinter;
+  btn.title = !selectedFile ? 'Upload a model file first' : !hasPrinter ? 'Select a printer first' : '';
+  btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
 }
 
 let fileQueue = [];        // {file, status, result, settings:null|{...}}
@@ -1899,8 +2029,8 @@ function deleteQueueItem(i) {
   if (fileQueue.length === 0) { clearQueue(); return; }
   selectedFile = fileQueue[0]?.file || null;
   renderQueue();
+  updateRunBtn();
   const btn = document.getElementById('run-btn');
-  btn.disabled    = false;
   btn.textContent = fileQueue.length > 1 ? 'Quote All' : 'Generate Quote';
   if (fileQueue.length > 1) {
     // Refresh the batch summary table to remove the deleted row
@@ -1943,12 +2073,17 @@ function hideProgressPanel() {
 
 function startProgressPoll(pid) {
   _activePid = pid;
+  let _pollFails = 0;
   _pollTimer = setInterval(async () => {
     try {
       const res  = await fetch(`/api/progress/${pid}`);
       const steps = await res.json();
       renderServerSteps(steps);
-    } catch(e) {}
+      _pollFails = 0;
+    } catch(e) {
+      _pollFails++;
+      if (_pollFails >= 5) addProgressStep('Server connection', 'error', 'connection lost — retrying…');
+    }
   }, 350);
 }
 
@@ -1985,11 +2120,13 @@ function renderServerSteps(serverSteps) {
 function switchRcTab(tab) {
   document.getElementById('tab-quote').classList.toggle('active', tab === 'quote');
   document.getElementById('tab-health').classList.toggle('active', tab === 'health');
-  const showQuote  = tab === 'quote';
-  const quoteVis   = window._lastQuote || fileQueue.some(i => i.status === 'done');
-  document.getElementById('results').style.display       = (showQuote && window._lastQuote && fileQueue.length <= 1) ? 'block' : 'none';
-  document.getElementById('batch-results').style.display = (showQuote && fileQueue.length > 1 && fileQueue.some(i => i.status === 'done')) ? 'block' : 'none';
-  document.getElementById('health-panel').style.display  = tab === 'health' ? 'block' : 'none';
+  const showQuote    = tab === 'quote';
+  const preflighting = document.getElementById('preflight-panel').style.display !== 'none';
+  document.getElementById('results').style.display       = (showQuote && !preflighting && window._lastQuote && fileQueue.length <= 1) ? 'block' : 'none';
+  document.getElementById('batch-results').style.display = (showQuote && !preflighting && fileQueue.length > 1 && fileQueue.some(i => i.status === 'done')) ? 'block' : 'none';
+  document.getElementById('placeholder').style.display   = (showQuote && !preflighting && !window._lastQuote && !fileQueue.some(i => i.status === 'done')) ? 'flex' : 'none';
+  // When preflight is showing, the preflight panel already contains all health info — don't double up
+  document.getElementById('health-panel').style.display  = (tab === 'health' && !preflighting) ? 'block' : 'none';
 }
 
 function updateHealthTab() {
@@ -2082,6 +2219,7 @@ function renderQueue() {
 function clearQueue() {
   fileQueue = []; selectedFile = null; selectedQueueIdx = -1;
   window._preflightOversized = [];
+  window._lastQuote = null;
   renderQueue();
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
@@ -2089,6 +2227,11 @@ function clearQueue() {
   document.getElementById('file-name').textContent = '';
   document.getElementById('drop-zone').classList.remove('has-file');
   document.getElementById('preflight-panel').style.display = 'none';
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('batch-results').style.display = 'none';
+  document.getElementById('error-box').style.display = 'none';
+  document.getElementById('rc-tabs').style.display = 'none';
+  document.getElementById('placeholder').style.display = 'flex';
 }
 
 function minsFromStr(s) {
@@ -2109,13 +2252,24 @@ function minsToStr(m) {
   return `${mn}m`;
 }
 
+function validateInputs() {
+  const qty = parseInt(document.getElementById('quantity').value);
+  if (isNaN(qty) || qty < 1) { document.getElementById('quantity').value = 1; }
+  const fs = parseInt(document.getElementById('farm-size').value);
+  if (isNaN(fs) || fs < 1) { document.getElementById('farm-size').value = 1; }
+  return true;
+}
+
+let _isQuoting = false;
 async function runQuote() {
+  if (_isQuoting) return;
+  validateInputs();
+  _isQuoting = true;
+  try {
   if (fileQueue.length > 1) { await runBatch(); return; }
-  // Single file already quoted — show cached result, no re-slice
-  if (fileQueue.length === 1 && fileQueue[0].status === 'done') {
-    showResults(fileQueue[0].result); return;
-  }
   if (!selectedFile) return;
+  if (fileQueue.length === 1) fileQueue[0].status = 'pending';
+  window._lastQuote = null;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
   document.getElementById('error-box').style.display    = 'none';
@@ -2123,37 +2277,53 @@ async function runQuote() {
   document.getElementById('placeholder').style.display  = 'none';
   document.getElementById('batch-results').style.display = 'none';
   document.getElementById('preflight-panel').style.display = 'none';
+  document.getElementById('rc-tabs').style.display         = 'none';
   saveInputs();
 
   // Pre-flight check
   const s = getFormSettings();
   if (s.printer) {
+    _clientSteps = [];
+    showProgressPanel('Pre-flight Check', selectedFile.name);
     btn.innerHTML = `<span class="spinner"></span> Checking…`;
+    addProgressStep('Checking mesh & dimensions', 'running', '…');
     try {
       const fd = new FormData();
       fd.append('file', selectedFile);
       fd.append('printer', s.printer);
       const res  = await fetch('/api/check_size', {method:'POST', body:fd});
       const data = await res.json();
-      // Store on queue item for health tab
       if (fileQueue.length === 1) fileQueue[0].sizeCheck = data;
-      const hasIssues = data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0);
       updateHealthTab();
+      const hasIssues = data.overflow_warning || (data.mesh_warnings && data.mesh_warnings.length > 0);
+      const pfDetail = data.overflow_warning
+        ? data.overflow_warning
+        : ((data.mesh_warnings||[]).length
+            ? `${data.mesh_warnings.length} warning${data.mesh_warnings.length>1?'s':''}`
+            : (data.size ? `${data.size.x}×${data.size.y}×${data.size.z} mm` : 'ok'));
+      addProgressStep('Checking mesh & dimensions', hasIssues ? 'error' : 'done', pfDetail);
       if (hasIssues) {
         const tempItem = {file: selectedFile, sizeCheck: data, sizeOverride: 'warn', settings: s};
         window._preflightOversized = [tempItem];
         window._preflightCallback  = async () => { await _doSingleQuote(tempItem.sizeOverride); };
         _renderPreflightList([tempItem]);
         document.getElementById('preflight-panel').style.display = 'block';
-        document.getElementById('rc-tabs').style.display = 'flex';
+        document.getElementById('preflight-panel').scrollIntoView({behavior:'smooth', block:'nearest'});
         btn.disabled    = false;
         btn.textContent = 'Generate Quote';
         return;
       }
-    } catch(e) { console.warn('Pre-flight check failed', e); }
+      hideProgressPanel();
+    } catch(e) {
+      addProgressStep('Checking mesh & dimensions', 'error', 'pre-flight unavailable, proceeding to slice');
+      hideProgressPanel();
+      console.warn('Pre-flight check failed', e);
+    }
+    // brief pause so user can see pre-flight status before it transitions
   }
 
   await _doSingleQuote();
+  } finally { _isQuoting = false; }
 }
 
 async function _doSingleQuote(sizeOverride) {
@@ -2192,6 +2362,7 @@ async function _doSingleQuote(sizeOverride) {
 }
 
 async function runBatch() {
+  window._lastQuote = null;
   const btn = document.getElementById('run-btn');
   btn.disabled = true;
   document.getElementById('error-box').style.display    = 'none';
@@ -2199,10 +2370,14 @@ async function runBatch() {
   document.getElementById('placeholder').style.display  = 'none';
   document.getElementById('batch-results').style.display = 'none';
   document.getElementById('preflight-panel').style.display = 'none';
+  document.getElementById('rc-tabs').style.display         = 'none';
   saveInputs();
+  // Snapshot current form settings into any queue item that lacks custom settings
+  const currentSettings = getFormSettings();
   if (selectedQueueIdx >= 0 && selectedQueueIdx < fileQueue.length) {
-    fileQueue[selectedQueueIdx].settings = getFormSettings();
+    fileQueue[selectedQueueIdx].settings = currentSettings;
   }
+  fileQueue.forEach(item => { if (!item.settings) item.settings = currentSettings; });
 
   // ── Pre-flight: check sizes for pending files before slicing ──────────────
   const pendingItems = fileQueue.filter(item => item.status !== 'done');
@@ -2222,10 +2397,13 @@ async function runBatch() {
         const res  = await fetch('/api/check_size', {method:'POST', body:fd});
         const data = await res.json();
         item.sizeCheck = data;
-        const issues = [data.overflow_warning, ...(data.mesh_warnings||[])].filter(Boolean);
-        const detail = issues.length ? `${issues.length} issue${issues.length>1?'s':''}` : (data.size ? `${data.size.x}×${data.size.y}×${data.size.z} mm` : 'ok');
-        addProgressStep(item.file.name, issues.length ? 'error' : 'done', detail);
-        if (issues.length) oversized.push(item);
+        const hasOverflow   = !!data.overflow_warning;
+        const meshWarnCount = (data.mesh_warnings||[]).length;
+        const hasIssues     = hasOverflow || meshWarnCount > 0;
+        const detail = hasOverflow ? data.overflow_warning
+          : (meshWarnCount ? `${meshWarnCount} warning${meshWarnCount>1?'s':''}` : (data.size ? `${data.size.x}×${data.size.y}×${data.size.z} mm` : 'ok'));
+        addProgressStep(item.file.name, hasIssues ? 'error' : 'done', detail);
+        if (hasIssues) oversized.push(item);
       } catch(e) {
         addProgressStep(item.file.name, 'error', 'check failed');
         console.warn('Size check failed for', item.file.name, e);
@@ -2238,7 +2416,6 @@ async function runBatch() {
       window._preflightCallback  = async () => { await _runBatchSlice(); };
       _renderPreflightList(oversized);
       document.getElementById('preflight-panel').style.display = 'block';
-      document.getElementById('rc-tabs').style.display = 'flex';
       btn.disabled    = false;
       btn.textContent = 'Quote All';
       return;  // wait for user to click "Continue & Quote"
@@ -2250,6 +2427,10 @@ async function runBatch() {
 }
 
 function _renderPreflightList(items) {
+  const isBatch    = fileQueue.length > 1;
+  const anyOverflow = items.some(i => i.sizeCheck?.overflow_warning);
+  document.getElementById('preflight-confirm-btn').textContent = isBatch ? 'Continue & Quote All' : 'Continue & Quote';
+  document.getElementById('preflight-title-text').textContent  = anyOverflow ? '⚠ Oversize Files Detected' : '⚠ File Health Warnings';
   document.getElementById('preflight-list').innerHTML = items.map((item, idx) => {
     const sc = item.sizeCheck;
     const sz = sc.size ? `${sc.size.x}×${sc.size.y}×${sc.size.z} mm` : '';
@@ -2303,6 +2484,12 @@ async function _runBatchSlice() {
   document.getElementById('batch-results').style.display = 'none';
 
   const total = fileQueue.filter(i => i.status !== 'done').length;
+  if (total === 0) {
+    showBatchResults();
+    btn.disabled = false;
+    btn.textContent = 'Quote All';
+    return;
+  }
   let done = 0;
 
   for (let i = 0; i < fileQueue.length; i++) {
@@ -2395,20 +2582,25 @@ function openQuoteModal(i) {
 
   // Cost table
   const rows = [];
-  if (d.material_cost!=null) rows.push(`<tr><td>Material</td><td>$${d.material_cost.toFixed(2)}</td></tr>`);
-  if (d.machine_cost!=null)  rows.push(`<tr><td>Machine time</td><td>$${d.machine_cost.toFixed(2)}</td></tr>`);
-  if (d.subtotal!=null)      rows.push(`<tr><td>Subtotal</td><td>$${d.subtotal.toFixed(2)}</td></tr>`);
-  if (d.markup_amt!=null)    rows.push(`<tr><td>Markup (${d.markup_pct}%)</td><td>$${d.markup_amt.toFixed(2)}</td></tr>`);
-  if (d.quote_price!=null)   rows.push(`<tr class="total-row"><td>Quote Price</td><td>$${d.quote_price.toFixed(2)}</td></tr>`);
+  const mQty = d.quantity || 1; const mShowQty = mQty > 1;
+  if (d.material_cost!=null) rows.push(`<tr><td>Material</td><td>${mShowQty&&d.qty_material!=null?'$'+d.qty_material.toFixed(2)+' (×'+mQty+')':'$'+d.material_cost.toFixed(2)}</td></tr>`);
+  if (d.machine_cost!=null)  rows.push(`<tr><td>Machine time</td><td>${mShowQty&&d.qty_machine!=null?'$'+d.qty_machine.toFixed(2)+' (×'+mQty+')':'$'+d.machine_cost.toFixed(2)}</td></tr>`);
+  const mSubtotal = mShowQty&&d.qty_subtotal!=null?d.qty_subtotal:d.subtotal;
+  if (mSubtotal!=null&&(d.material_cost!=null||d.machine_cost!=null)) rows.push(`<tr><td>Subtotal${mShowQty?' (qty '+mQty+')':''}</td><td>$${mSubtotal.toFixed(2)}</td></tr>`);
+  if (d.markup_pct&&mSubtotal!=null) rows.push(`<tr><td>Markup (${d.markup_pct}%)</td><td>+$${(mSubtotal*d.markup_pct/100).toFixed(2)}</td></tr>`);
+  if (d.quote_price!=null)   rows.push(`<tr class="total-row"><td>Quote Price${mShowQty?' (qty '+mQty+')':''}</td><td>$${d.quote_price.toFixed(2)}</td></tr>`);
+  if (mShowQty&&d.unit_price!=null) rows.push(`<tr><td style="font-size:.78rem;color:var(--muted)">Per unit</td><td style="font-size:.78rem;color:var(--muted)">$${d.unit_price.toFixed(2)}</td></tr>`);
   document.getElementById('modal-cost-tbody').innerHTML = rows.join('');
 
   const dlBtn = document.getElementById('modal-dl-gcode');
   dlBtn.href = d.job_id ? `/api/export_gcode?job_id=${d.job_id}` : '/api/export_gcode';
 
   document.getElementById('quote-modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
 }
 function closeQuoteModal() {
   document.getElementById('quote-modal').classList.remove('open');
+  document.body.style.overflow = '';
 }
 function copyModalQuote() {
   if (!_modalQuote) return;
@@ -2421,7 +2613,12 @@ function copyModalQuote() {
   ];
   if (d.quote_price!=null) lines.push(`Quote: $${d.quote_price.toFixed(2)}`);
   else if (d.subtotal!=null) lines.push(`Subtotal: $${d.subtotal.toFixed(2)}`);
-  navigator.clipboard.writeText(lines.join('\\n')).catch(()=>{});
+  const btn = document.getElementById('modal-copy-btn');
+  navigator.clipboard.writeText(lines.join('\\n')).then(()=>{
+    if(btn){const orig=btn.textContent;btn.textContent='Copied!';setTimeout(()=>btn.textContent=orig,1500);}
+  }).catch(()=>{
+    if(btn){btn.textContent='Copy failed';setTimeout(()=>btn.textContent='Copy',1500);}
+  });
 }
 
 function showResults(d) {
@@ -2497,14 +2694,22 @@ function showResults(d) {
   // Cost table
   const tbody = document.getElementById('cost-tbody');
   tbody.innerHTML = '';
+  const qty = d.quantity || 1;
+  const showQty = qty > 1;
   const rows = [];
   if (d.material_cost != null) {
     const note = d.cost_per_kg ? `@ $${d.cost_per_kg}/kg` : 'from profile';
-    rows.push(['Material', `$${d.material_cost.toFixed(2)}`, note]);
+    const val  = showQty && d.qty_material != null
+      ? `$${d.qty_material.toFixed(2)} <span class="muted">(×${qty})</span>`
+      : `$${d.material_cost.toFixed(2)}`;
+    rows.push([`Material`, val, note]);
   }
   if (d.machine_cost != null) {
     const mins = Math.round(parseTimeToMins(d.time));
-    rows.push(['Machine time', `$${d.machine_cost.toFixed(2)}`, `${mins} min @ $${d.hourly_rate}/hr`]);
+    const val  = showQty && d.qty_machine != null
+      ? `$${d.qty_machine.toFixed(2)} <span class="muted">(×${qty})</span>`
+      : `$${d.machine_cost.toFixed(2)}`;
+    rows.push(['Machine time', val, `${mins} min @ $${d.hourly_rate}/hr`]);
   }
   if (rows.length === 0) {
     tbody.innerHTML = '<tr><td style="color:var(--muted);font-size:.82rem;padding:.5rem 0" colspan="2">Add $/kg and $/hr above to see cost breakdown.</td></tr>';
@@ -2512,13 +2717,21 @@ function showResults(d) {
     for (const [label, val, note] of rows) {
       tbody.innerHTML += `<tr><td>${label} <span class="muted">${note}</span></td><td>${val}</td></tr>`;
     }
-    if (d.markup_pct && d.markup_amt != null) {
-      tbody.innerHTML += `<tr><td>Markup (${d.markup_pct}%)</td><td>+$${d.markup_amt.toFixed(2)}</td></tr>`;
+    const subtotalVal = showQty && d.qty_subtotal != null ? d.qty_subtotal : d.subtotal;
+    const markupBase  = subtotalVal;
+    if (d.markup_pct && markupBase != null) {
+      const markupAmt = markupBase * d.markup_pct / 100;
+      tbody.innerHTML += `<tr><td>Markup (${d.markup_pct}%)</td><td>+$${markupAmt.toFixed(2)}</td></tr>`;
     }
     if (d.quote_price != null) {
-      tbody.innerHTML += `<tr class="total-row"><td>Quote Price</td><td>$${d.quote_price.toFixed(2)}</td></tr>`;
-    } else if (d.subtotal != null) {
-      tbody.innerHTML += `<tr class="total-row"><td>Total Cost</td><td>$${d.subtotal.toFixed(2)}</td></tr>`;
+      const label = showQty ? `Quote Price (qty ${qty})` : 'Quote Price';
+      tbody.innerHTML += `<tr class="total-row"><td>${label}</td><td>$${d.quote_price.toFixed(2)}</td></tr>`;
+      if (showQty && d.unit_price != null) {
+        tbody.innerHTML += `<tr><td class="muted" style="font-size:.78rem">Per unit</td><td style="font-size:.78rem;color:var(--muted)">$${d.unit_price.toFixed(2)}</td></tr>`;
+      }
+    } else if (subtotalVal != null) {
+      const label = showQty ? `Total Cost (qty ${qty})` : 'Total Cost';
+      tbody.innerHTML += `<tr class="total-row"><td>${label}</td><td>$${subtotalVal.toFixed(2)}</td></tr>`;
     }
   }
 
@@ -2546,6 +2759,8 @@ function showResults(d) {
   }
 
   window._lastQuote = d;
+  const dlGcode = document.getElementById('dl-gcode-btn');
+  if (dlGcode) dlGcode.href = d.job_id ? `/api/export_gcode?job_id=${d.job_id}` : '/api/export_gcode';
 }
 
 function showError(msg) {
@@ -2588,6 +2803,10 @@ function copyQuote() {
     const btn = document.querySelector('.copy-btn');
     btn.textContent = 'Copied!';
     setTimeout(() => btn.textContent = 'Copy Quote', 1500);
+  }).catch(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copy failed';
+    setTimeout(() => btn.textContent = 'Copy Quote', 1500);
   });
 }
 
@@ -2596,10 +2815,15 @@ async function download3mf() {
   btn.textContent = 'Exporting…';
   btn.disabled = true;
   try {
-    const res = await fetch('/api/export_3mf', { method: 'POST' });
+    const jid = window._lastQuote ? window._lastQuote.job_id : '';
+    const res = await fetch('/api/export_3mf', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({job_id: jid})
+    });
     if (!res.ok) {
       const data = await res.json();
-      alert('Export failed: ' + (data.error || res.statusText));
+      showError('3MF export failed: ' + (data.error || res.statusText));
       return;
     }
     const blob = await res.blob();
@@ -2612,7 +2836,7 @@ async function download3mf() {
     a.click();
     URL.revokeObjectURL(url);
   } catch (e) {
-    alert('Export error: ' + e);
+    showError('3MF export error: ' + e);
   } finally {
     btn.textContent = 'Download 3MF';
     btn.disabled = false;
@@ -2654,13 +2878,32 @@ function loadPreset() {
   if (s.hourly_rate)  document.getElementById('hourly-rate').value = s.hourly_rate;
   if (s.markup)       document.getElementById('markup').value = s.markup;
   if (s.farm_size)    document.getElementById('farm-size').value = s.farm_size;
+  if (s.time_factor)  document.getElementById('time-factor').value = s.time_factor;
+  if (s.quantity)      document.getElementById('quantity').value = s.quantity;
+  if (s.size_mode)     setSizeMode(s.size_mode);
+  if (s.size_val)      document.getElementById('size-val').value = s.size_val;
+  if (s.auto_orient !== undefined)    document.getElementById('chk-orient').checked = s.auto_orient === 'true' || s.auto_orient === true;
+  if (s.auto_split !== undefined)     document.getElementById('chk-split').checked = s.auto_split === 'true' || s.auto_split === true;
+  if (s.auto_scale_fit !== undefined) document.getElementById('chk-scale-fit').checked = s.auto_scale_fit === 'true' || s.auto_scale_fit === true;
 }
 
-async function savePreset() {
-  const name = prompt('Preset name:');
-  if (!name || !name.trim()) return;
+function savePreset() {
+  document.getElementById('preset-save-btn').style.display  = 'none';
+  document.getElementById('preset-save-row').style.display  = 'block';
+  const inp = document.getElementById('preset-name-input');
+  inp.value = '';
+  inp.focus();
+}
+function cancelSavePreset() {
+  document.getElementById('preset-save-row').style.display = 'none';
+  document.getElementById('preset-save-btn').style.display = '';
+}
+async function confirmSavePreset() {
+  const name = document.getElementById('preset-name-input').value.trim();
+  if (!name) { document.getElementById('preset-name-input').focus(); return; }
+  if (presetsCache[name] && !confirm('Preset "' + name + '" already exists. Overwrite?')) return;
   const body = {
-    name:          name.trim(),
+    name,
     printer:       document.getElementById('printer-sel').value,
     print_profile: document.getElementById('print-profile-sel').value,
     filament:      document.getElementById('filament-sel').value,
@@ -2672,45 +2915,65 @@ async function savePreset() {
     hourly_rate:   document.getElementById('hourly-rate').value,
     markup:        document.getElementById('markup').value,
     farm_size:     document.getElementById('farm-size').value,
+    time_factor:   document.getElementById('time-factor').value,
+    size_mode:     sizeMode,
+    size_val:      document.getElementById('size-val').value,
+    quantity:      document.getElementById('quantity').value,
+    auto_orient:   document.getElementById('chk-orient').checked,
+    auto_split:    document.getElementById('chk-split').checked,
+    auto_scale_fit:document.getElementById('chk-scale-fit').checked,
   };
   try {
     const res = await fetch('/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     if (!res.ok) throw new Error('Server returned ' + res.status);
+    cancelSavePreset();
     await loadPresetsList();
-    document.getElementById('preset-sel').value = body.name;
+    document.getElementById('preset-sel').value = name;
   } catch(e) {
-    alert('Failed to save preset: ' + e.message);
+    showError('Failed to save preset: ' + e.message);
+    cancelSavePreset();
   }
 }
 
-async function deletePreset() {
+function deletePreset() {
   const name = document.getElementById('preset-sel').value;
   if (!name) return;
-  if (!confirm(`Delete preset "${name}"?`)) return;
+  document.getElementById('preset-delete-label').textContent = `Delete "${name}"?`;
+  document.getElementById('preset-delete-confirm').style.display = 'flex';
+  document.getElementById('preset-bar').style.display = 'none';
+}
+function cancelDeletePreset() {
+  document.getElementById('preset-delete-confirm').style.display = 'none';
+  document.getElementById('preset-bar').style.display = '';
+}
+async function confirmDeletePreset() {
+  const name = document.getElementById('preset-sel').value;
+  cancelDeletePreset();
   try {
     const res = await fetch('/api/presets/' + encodeURIComponent(name), {method:'DELETE'});
     if (!res.ok) throw new Error('Server returned ' + res.status);
     await loadPresetsList();
   } catch(e) {
-    alert('Failed to delete preset: ' + e.message);
+    showError('Failed to delete preset: ' + e.message);
   }
 }
 
 const PERSIST_IDS = ['cost-per-kg', 'hourly-rate', 'markup', 'quantity', 'infill', 'layer-height', 'walls', 'time-factor', 'farm-size'];
 function saveInputs() {
-  for (const id of PERSIST_IDS) { const el = document.getElementById(id); if (el && el.value) localStorage.setItem('input_' + id, el.value); }
+  for (const id of PERSIST_IDS) { const el = document.getElementById(id); if (el) localStorage.setItem('input_' + id, el.value); }
 }
 function restoreInputs() {
-  for (const id of PERSIST_IDS) { const val = localStorage.getItem('input_' + id); if (val) document.getElementById(id).value = val; }
+  for (const id of PERSIST_IDS) { const val = localStorage.getItem('input_' + id); if (val !== null) document.getElementById(id).value = val; }
   // Restore support mode
   const savedSupport = localStorage.getItem('supportMode');
   if (savedSupport) setSupportMode(savedSupport);
   // Restore checkbox states
-  for (const id of ['auto-orient', 'auto-split']) {
+  const rowMap = {'auto-orient': 'orient-row', 'auto-split': 'split-row', 'auto-scale-fit': 'scale-fit-row'};
+  for (const id of ['auto-orient', 'auto-split', 'auto-scale-fit']) {
     const saved = localStorage.getItem('chk_' + id);
     if (saved === 'true') {
       document.getElementById(id).checked = true;
-      toggleFeature(id === 'auto-orient' ? 'orient-row' : 'split-row', id);
+      toggleFeature(rowMap[id], id);
     }
   }
 }
@@ -2721,6 +2984,13 @@ document.getElementById('auto-orient').addEventListener('change', function() {
 });
 document.getElementById('auto-split').addEventListener('change', function() {
   localStorage.setItem('chk_auto-split', this.checked);
+});
+document.getElementById('auto-scale-fit').addEventListener('change', function() {
+  localStorage.setItem('chk_auto-scale-fit', this.checked);
+});
+document.getElementById('preset-name-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') confirmSavePreset();
+  if (e.key === 'Escape') cancelSavePreset();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeQuoteModal(); });
 
@@ -2757,7 +3027,7 @@ init();
     <table class="cost-table"><tbody id="modal-cost-tbody"></tbody></table>
     <div style="display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap">
       <a id="modal-dl-gcode" class="copy-btn" href="#" style="text-decoration:none;padding:0.35rem 0.7rem">Download GCode</a>
-      <button class="copy-btn" onclick="copyModalQuote()">Copy Quote</button>
+      <button class="copy-btn" id="modal-copy-btn" onclick="copyModalQuote()">Copy Quote</button>
     </div>
   </div>
 </div>
@@ -2822,8 +3092,9 @@ async function clearDebugLog() {
   loadDebugLog();
 }
 
-// Poll for new errors every 10s so the button badge stays current
+// Poll for new errors every 10s so the button badge stays current (skip when tab hidden)
 setInterval(() => {
+  if (document.hidden) return;
   fetch('/api/debug_log').then(r => r.json()).then(entries => {
     const btn = document.getElementById('debug-btn');
     btn.classList.toggle('has-errors', entries.length > 0);
